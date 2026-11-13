@@ -14,6 +14,7 @@ class OPTAcquisitionDevice(enum.Enum):
     """
 
     OCTScanner = ("SRT", "A-00FBE", "Optical Coherence Tomography Scanner")
+    FundusCamera = ("SRT", "R-1021A", "Fundus Camera")
     RetinalThicknessAnalyzer = ("SRT", "R-FAB5A", "Retinal Thickness Analyzer")
     ConfocalScanningLaserOphthalmoscope = (
         "SRT",
@@ -99,6 +100,10 @@ class SeriesMeta:
     # Scan
     protocol: str = ""
     description: str = ""
+    # CID 4272 (scheme, code, meaning). Empty means the writer infers one.
+    scan_pattern: tuple[str, str, str] | None = None
+    # Structural B-scans captured as part of an OCT angiography scan.
+    octa: bool = False
 
 
 @dataclasses.dataclass
@@ -133,10 +138,36 @@ class ScanGeometryMeta:
     frame_lines: t.Optional[list] = None
 
 
+@dataclasses.dataclass(frozen=True)
+class OCTDeviceSpecs:
+    """Published manufacturer device data, separate from DICOM OPT tags.
+
+    Brochure optical resolutions are retained here for reference. Only the
+    ``dicom_*`` fields are considered validated against PS3.3 C.8.17.9
+    semantics and may be copied into ``OCTImageParams``.
+    """
+
+    wavelength_nm: t.Optional[float] = None
+    bandwidth_nm: t.Optional[float] = None
+    optical_axial_resolution_um: t.Optional[float] = None
+    optical_lateral_resolution_um: t.Optional[float] = None
+    # Populate only when equivalence to DICOM definitions is established.
+    dicom_depth_resolution_um: t.Optional[float] = None
+    dicom_alongscan_resolution_um: t.Optional[float] = None
+    dicom_acrossscan_resolution_um: t.Optional[float] = None
+    # Bandwidth for IlluminationBandwidth once the brochure convention
+    # (FWHM vs half-bandwidth) is confirmed against DICOM.
+    dicom_bandwidth_nm: t.Optional[float] = None
+
+
 @dataclasses.dataclass
 class OCTImageParams:
     # PS3.3 C.8.17.9
     opt_acquisition_device: OPTAcquisitionDevice = OPTAcquisitionDevice.Unspecified
+    # When true, non-empty optical values below are validated for DICOM write.
+    device_specs: bool = False
+    # Matched manufacturer brochure record; not written as DICOM by itself.
+    manufacturer_specs: t.Optional[OCTDeviceSpecs] = None
     DetectorType: OCTDetectorType = OCTDetectorType.Unknown
     IlluminationWaveLength: t.Optional[float] = None
     IlluminationPower: t.Optional[float] = None
