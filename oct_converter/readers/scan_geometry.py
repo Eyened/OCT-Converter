@@ -362,7 +362,65 @@ def start_angle_from_reference_coordinates(
 SCAN_PATTERN_CUBE = ("DCM", "128279", "Cube B-scan pattern")
 SCAN_PATTERN_RASTER = ("DCM", "128280", "Raster B-scan pattern")
 SCAN_PATTERN_LINE = ("DCM", "128281", "Line B-scan pattern")
+SCAN_PATTERN_RADIAL = ("DCM", "128282", "Radial B-scan pattern")
+SCAN_PATTERN_CROSS = ("DCM", "128283", "Cross B-scan pattern")
 SCAN_PATTERN_CIRCLE = ("DCM", "128284", "Circle B-scan pattern")
+
+# IMG header scan_mode values observed in Topcon FDA files, aligned with
+# vendor protocol labels and the native OPT localizer:
+# 0 line, 1 circle, 2 rectangular 3D (including OCTA cubes), 3 radial,
+# 4 two-line cross, 6 vertical 3D, 11 five-line cross.
+_TOPCON_VOLUME_MODES = {2, 6}
+_TOPCON_LINE_LIKE_MODES = {0, 3, 4, 11}
+
+
+def topcon_scan_pattern(
+    scan_mode: int | None, num_frames: int = 1
+) -> tuple[str, str, str]:
+    """CID 4272 code for a Topcon IMG-header scan mode."""
+    mode = int(scan_mode) if scan_mode is not None else -1
+    if mode == 0:
+        return SCAN_PATTERN_LINE
+    if mode == 1:
+        return SCAN_PATTERN_CIRCLE
+    if mode == 3:
+        return SCAN_PATTERN_RADIAL
+    if mode in (4, 11):
+        return SCAN_PATTERN_CROSS
+    if mode in _TOPCON_VOLUME_MODES:
+        return SCAN_PATTERN_CUBE
+    if int(num_frames or 1) > 1:
+        return SCAN_PATTERN_CUBE
+    return SCAN_PATTERN_LINE
+
+
+def topcon_pixel_spacing(
+    scan_mode: int | None,
+    width: int,
+    number_slices: int,
+    x_mm: float,
+    y_mm: float,
+    z_um: float,
+) -> list[float]:
+    """Pixel spacing as [lateral mm, slice step mm, axial mm].
+
+    A rectangular stack (3D or vertical 3D) steps ``y_mm`` across ``n - 1``
+    intervals. A circle stores its radius in ``x_mm``, so the A-scan step is
+    the circumference divided by the width. Line, radial, and cross scans
+    have no stack interval; their ``y_mm`` is either zero or the gap between
+    parallel lines, not a slice thickness.
+    """
+    columns = max(int(width or 1), 1)
+    slices = max(int(number_slices or 1), 1)
+    axial = float(z_um) / 1000.0
+    mode = int(scan_mode) if scan_mode is not None else -1
+    if mode == 1:
+        lateral = (2.0 * math.pi * float(x_mm)) / columns
+        return [lateral, 0.0, axial]
+    if mode in _TOPCON_LINE_LIKE_MODES:
+        return [float(x_mm) / columns, 0.0, axial]
+    steps = max(slices - 1, 1)
+    return [float(x_mm) / columns, float(y_mm) / steps, axial]
 
 
 def scan_pattern_code(
