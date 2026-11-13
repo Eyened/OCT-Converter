@@ -51,6 +51,11 @@ SURFACE_CID4273: dict[str, tuple[str, str, str]] = {
     "OPL": ("DCM", "128293", "Outer surface of OPL"),
     "ELM": ("SCT", "76710003", "ELM - External limiting membrane"),
     "RPE": ("DCM", "128298", "Surface of the center of the RPE"),
+    # Topcon names a single boundary. These are the CID 4273 surfaces that
+    # match that boundary, rather than a neighbouring layer.
+    "IZ_RPE": ("DCM", "128324", "Outer surface of the interdigitation zone"),
+    "MZ_EZ": ("DCM", "128320", "Inner surface of the ellipsoid zone"),
+    "CSI": ("DCM", "128301", "Surface of the choroid-sclera interface"),
 }
 
 # Topcon FDA contour key -> (SegmentLabel used for CID lookup / display).
@@ -63,8 +68,7 @@ TOPCON_LAYER_LABELS: dict[str, str] = {
     "INL_OPL": "INL",
     "ELM": "ELM",
     "BM": "BM",
-    "IZ_RPE": "RPE",
-    # No exact CID 4273 match — SegmentLabel kept as source key; private fallback.
+    "IZ_RPE": "IZ_RPE",
     "MZ_EZ": "MZ_EZ",
     "CSI": "CSI",
 }
@@ -74,8 +78,8 @@ _TOPCON_LAYER_IDS: dict[str, int] = {
     name: 1000 + i for i, name in enumerate(TOPCON_LAYER_LABELS)
 }
 
-# BCID 7150 Segmentation Property Categories
-ANATOMICAL_STRUCTURE_CATEGORY = ("SRT", "T-D0050", "Anatomical Structure")
+# BCID 7150 Segmentation Property Categories. SRT T-D0050 is Tissue.
+ANATOMICAL_STRUCTURE_CATEGORY = ("SRT", "T-D0050", "Tissue")
 
 # Fallback for unmapped surface labels
 _GENERIC_PROPERTY_TYPE = ("OCT-converter", "L-0001", "Unspecified retinal surface")
