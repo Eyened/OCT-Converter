@@ -1,18 +1,65 @@
 from __future__ import annotations
 
 import io
-import struct
+import os
 import typing as t
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
+import cv2
 import numpy as np
-from construct import ListContainer
-from PIL import Image
+from construct import ListContainer, StreamError
 
 from oct_converter.image_types import FundusImageWithMetaData, OCTVolumeWithMetaData
 from oct_converter.readers.binary_structs import fda_binary
 from oct_converter.readers.scan_geometry import topcon_pixel_spacing
+
+def _imdecode(raw: bytes, flags: int = cv2.IMREAD_UNCHANGED) -> np.ndarray:
+    """Decode a JPEG or JPEG 2000 payload to an array.
+
+    OpenCV releases the GIL while decoding, so callers can decode independent
+    slices in parallel. Pillow's decoder does not.
+    """
+    image = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), flags)
+    if image is None:
+        raise ValueError("Failed to decode image")
+    return image
+
+
+def _as_gray_if_repeated(image: np.ndarray) -> np.ndarray:
+    """Collapse a 3-channel image whose channels are copies of one grayscale.
+
+    Triton OCT angiography B-scans are 8-bit grayscale stored as PNG with
+    three identical channels. The OPT image is monochrome.
+    """
+    if image.ndim != 3 or image.shape[-1] not in (3, 4):
+        return image
+    channels = image[..., :3]
+    if np.array_equal(channels[..., 0], channels[..., 1]) and np.array_equal(
+        channels[..., 1], channels[..., 2]
+    ):
+        return np.ascontiguousarray(channels[..., 0])
+    return image
+
+
+def _decode_slices(raw_slices: list[bytes]) -> list[np.ndarray]:
+    if len(raw_slices) <= 1:
+        decoded = [_imdecode(raw) for raw in raw_slices]
+    else:
+        workers = min(len(raw_slices), os.cpu_count() or 1)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            decoded = list(pool.map(_imdecode, raw_slices))
+    return [_as_gray_if_repeated(image) for image in decoded]
+
+
+def _read_chunk_bytes(f, chunk_location, chunk_size) -> bytes:
+    """Read one chunk payload. Repeated chunks use the first occurrence."""
+    if isinstance(chunk_location, list):
+        f.seek(chunk_location[0])
+        return f.read(chunk_size[0])
+    f.seek(chunk_location)
+    return f.read(chunk_size)
 
 
 class FDA(object):
@@ -70,19 +117,26 @@ class FDA(object):
             print("")
         return chunk_dict, header
 
-    def read_oct_volume(self, verbose=False) -> OCTVolumeWithMetaData:
+    def read_oct_volume(
+        self, verbose=False, *, decode: bool = True
+    ) -> OCTVolumeWithMetaData:
         """Reads OCT data.
 
         Notes:
             Mostly based on description of .fda file format here:
             https://bitbucket.org/uocte/uocte/wiki/Topcon%20File%20Format
 
+        Args:
+            verbose: if True, prints unsupported metadata chunks.
+            decode: if False and the volume is ``@IMG_JPEG``, ``volume`` is
+                the raw JPEG 2000 payloads instead of decoded arrays.
+
         Returns:
             OCTVolumeWithMetaData
         """
         # read oct data chunk, whether that's IMG_JPEG or IMG_MOT_COMP_03
         # TODO: could support the other IMG_MOT_COMP variants as well.
-        volume, oct_header = self.read_oct_data_chunk()
+        volume, oct_header = self.read_oct_data_chunk(decode=decode)
         # if oct data is found, calculate pixel spacing.
         if oct_header:
             pixel_spacing = self.read_scan_params(oct_header)
@@ -128,12 +182,16 @@ class FDA(object):
 
         return oct_volume
 
-    def read_oct_data_chunk(self) -> t.Tuple[np.ndarray, dict]:
+    def read_oct_data_chunk(self, *, decode: bool = True) -> t.Tuple[list, dict]:
         """Given available chunks, identifies which chunk to utilize
         as the primary OCT data and returns the volume.
 
+        Args:
+            decode: if False, ``@IMG_JPEG`` slices are returned as the raw
+                bytes stored in the file (JPEG 2000) instead of arrays.
+
         Returns:
-            volume: OCT volume as array
+            volume: OCT volume as a list of arrays, or JPEG 2000 payloads
             oct_header: OCT header as dict
         """
         if b"@IMG_JPEG" in self.chunk_dict:
@@ -143,12 +201,13 @@ class FDA(object):
                 raw = f.read(25)
                 oct_header = fda_binary.oct_header.parse(raw)
 
-                volume = []
-                for i in range(oct_header.number_slices):
-                    size = np.frombuffer(f.read(4), dtype=np.int32)[0]
-                    raw_slice = f.read(size)
-                    image = Image.open(io.BytesIO(raw_slice))
-                    volume.append(np.asarray(image))
+                raw_slices = []
+                for _ in range(oct_header.number_slices):
+                    size = int.from_bytes(f.read(4), "little", signed=True)
+                    raw_slices.append(f.read(size))
+            if not decode:
+                return raw_slices, dict(oct_header)
+            volume = _decode_slices(raw_slices)
             return volume, dict(oct_header)
 
         elif b"@IMG_MOT_COMP_03" in self.chunk_dict:
@@ -237,14 +296,18 @@ class FDA(object):
             f.seek(chunk_location)  # Set the chunk’s current position.
             raw = f.read(24)  # skip 24 is important
             fundus_header = fda_binary.fundus_header.parse(raw)
-            number_pixels = fundus_header.width * fundus_header.height * 3
             raw_image = f.read(fundus_header.size)
-            image = Image.open(io.BytesIO(raw_image))
-            image = np.asarray(image)
-            # store with RGB channel order
-            image = np.flip(image, 2)
+            # cv2 returns BGR, which matches the previous Pillow path
+            # (RGB decoded, then a channel-axis flip).
+            image = _imdecode(raw_image)
         fundus_image = FundusImageWithMetaData(image)
         return fundus_image
+
+    def read_fundus_image_bytes(self) -> bytes | None:
+        """Return the ``@IMG_FUNDUS`` payload without decoding it."""
+        return self._read_sized_image(
+            b"@IMG_FUNDUS", fda_binary.fundus_header, 24
+        )
 
     def read_fundus_image_gray_scale(self) -> FundusImageWithMetaData:
         """Reads grayscale fundus image.
@@ -260,13 +323,32 @@ class FDA(object):
             f.seek(chunk_location)  # Set the chunk’s current position.
             raw = f.read(21)  # skip 21 is important
             img_trc_02_header = fda_binary.img_trc_02_header.parse(raw)
-            number_pixels = img_trc_02_header.width * img_trc_02_header.height * 1
             raw_image = f.read(img_trc_02_header.size)
             # TRC JPEGs are often encoded as RGB with identical channels;
             # force true 2-D grayscale for DICOM MONOCHROME2 export.
-            image = np.asarray(Image.open(io.BytesIO(raw_image)).convert("L"))
+            image = _imdecode(raw_image, flags=cv2.IMREAD_GRAYSCALE)
         fundus_gray_scale_image = FundusImageWithMetaData(image)
         return fundus_gray_scale_image
+
+    def read_fundus_image_gray_scale_bytes(self) -> bytes | None:
+        """Return the ``@IMG_TRC_02`` payload without decoding it."""
+        return self._read_sized_image(
+            b"@IMG_TRC_02", fda_binary.img_trc_02_header, 21
+        )
+
+    def _read_sized_image(
+        self, chunk_name: bytes, header, header_size: int
+    ) -> bytes | None:
+        """Read one image chunk's payload using the size field in its header."""
+        if chunk_name not in self.chunk_dict:
+            return None
+        with open(self.filepath, "rb") as f:
+            chunk_location, _chunk_size = self.chunk_dict[chunk_name]
+            if isinstance(chunk_location, list):
+                chunk_location = chunk_location[0]
+            f.seek(chunk_location)
+            parsed = header.parse(f.read(header_size))
+            return f.read(int(parsed.size))
 
     def read_segmentation(self) -> dict:
         """Reads layer segmentation data.
@@ -304,8 +386,9 @@ class FDA(object):
                 n_voxel = header["width"] * header["height"]
 
                 data_bytes = f.read(n_voxel * 2)
-                seg = struct.unpack("H" * n_voxel, data_bytes)
-                seg = np.array(seg).reshape((header["height"], header["width"]))
+                seg = np.frombuffer(data_bytes, dtype="<u2").reshape(
+                    (header["height"], header["width"])
+                )
                 seg = np.flip(seg, 0)
                 layer_name = layer.get(header["id"], header["id"])
                 seg_dict[layer_name] = seg
@@ -352,13 +435,20 @@ class FDA(object):
             return None
         with open(self.filepath, "rb") as f:
             chunk_location, chunk_size = self.chunk_dict[chunk_name]
-            if chunk_location.__class__ is list:
-                f.seek(chunk_location[0])
-            else:
-                f.seek(chunk_location)  # Set the chunk’s current position.
-            raw = f.read()
+            start = (
+                chunk_location[0] if isinstance(chunk_location, list) else chunk_location
+            )
+            raw = _read_chunk_bytes(f, chunk_location, chunk_size)
             header_name = f"{chunk_name.decode().split('@')[-1].lower()}_header"
-            chunk_info_header = dict(fda_binary.__dict__[header_name].parse(raw))
+            parser = fda_binary.__dict__[header_name]
+            try:
+                chunk_info_header = dict(parser.parse(raw))
+            except StreamError:
+                # A few structs (ALIGN_INFO, PATIENTEXT_INFO) declare more
+                # bytes than the chunk length and historically parsed by
+                # reading into the following chunk.
+                f.seek(start)
+                chunk_info_header = dict(parser.parse(f.read()))
             chunks_info = dict()
             for idx, key in enumerate(chunk_info_header.keys()):
                 if idx == 0:
@@ -377,8 +467,7 @@ class FDA(object):
         """
         with open(self.filepath, "rb") as f:
             chunk_location, chunk_size = self.chunk_dict[b"@PARAM_OBS_02"]
-            f.seek(chunk_location)  # Set the chunk’s current position.
-            raw = f.read()
+            raw = _read_chunk_bytes(f, chunk_location, chunk_size)
             # PARAM_OBS_02 is either of size 90 or size 6.
             if chunk_size == 90:
                 chunk_info_header = dict(fda_binary.param_obs_02_header.parse(raw))
