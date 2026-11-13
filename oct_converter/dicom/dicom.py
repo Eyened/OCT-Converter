@@ -26,7 +26,12 @@ from pydicom.valuerep import DSfloat
 from oct_converter.dicom.boct_meta import boct_dicom_metadata
 from oct_converter.dicom.e2e_meta import e2e_dicom_metadata
 from oct_converter.dicom.fda_meta import fda_dicom_metadata, opt_series_fallback
-from oct_converter.dicom.j2k import J2KFrames, is_jpeg2000, prepare_j2k_frames
+from oct_converter.dicom.j2k import (
+    J2KFrames,
+    encode_j2k_lossless_frames,
+    is_jpeg2000,
+    prepare_j2k_frames,
+)
 from oct_converter.dicom.fds_meta import fds_dicom_metadata
 from oct_converter.dicom.heightmap import (
     HEIGHTMAP_PADDING_VALUE,
@@ -595,17 +600,28 @@ def write_oct_bscan_volume_analysis_dicom(
     ds.InConcatenationTotalNumber = 1
 
     signed = [np.ascontiguousarray(np.asarray(f), dtype=np.int16) for f in frames]
-    pixel_data = np.stack(signed, axis=0)
-    _apply_pixel_encoding_tags(ds, 16, pixel_representation=1)
+    j2k = prepare_j2k_frames(encode_j2k_lossless_frames(signed))
+    if j2k.samples != 1:
+        raise ValueError(
+            "OCTA flow JPEG 2000 frames must be single component, "
+            f"got {j2k.samples}."
+        )
+    # IOD requires signed samples; the reversible codestream must match.
+    if j2k.pixel_representation != 1:
+        raise ValueError(
+            "OCTA flow JPEG 2000 must be signed (Pixel Representation 1), "
+            f"got {j2k.pixel_representation}."
+        )
+    _apply_j2k_pixels(ds, j2k)
     # Supplement 197 / PS3.3 A.84.3.1: VOI LUT Module must not be used on this
     # SOP Class. Windowing lives in Frame VOI LUT With LUT instead.
     for keyword in ("WindowCenter", "WindowWidth", "WindowCenterWidthExplanation"):
         if keyword in ds:
             del ds[keyword]
-    n_frames = int(pixel_data.shape[0])
+    n_frames = len(j2k.codestreams)
     ds.NumberOfFrames = n_frames
-    ds.Rows = int(pixel_data.shape[1])
-    ds.Columns = int(pixel_data.shape[2])
+    ds.Rows = j2k.rows
+    ds.Columns = j2k.columns
 
     # Acquisition method — Topcon OCTARA ≈ one-sided ratio (CID 4270).
     algo = Dataset()
@@ -693,7 +709,6 @@ def write_oct_bscan_volume_analysis_dicom(
         per_frame.append(frame_fgs)
     ds.PerFrameFunctionalGroupsSequence = per_frame
 
-    ds.PixelData = _pixel_data_bytes(pixel_data)
     ds.save_as(
         filepath, implicit_vr=False, little_endian=True, enforce_file_format=True
     )
@@ -764,6 +779,17 @@ def write_opt_dicom(
     _opt_multiframe_dimensions(ds)
 
     j2k = prepare_j2k_frames(list(compressed_frames)) if compressed_frames else None
+    if j2k is None and frames is not None:
+        # Decoded pixels (e.g. Triton PNG B-scans): re-encode JPEG 2000 lossless.
+        pixel_data, bits = _encode_pixel_array(frames)
+        if pixel_data.ndim == 2:
+            pixel_data = pixel_data[np.newaxis, ...]
+        if pixel_data.ndim != 3:
+            raise ValueError(
+                f"Expected OCT frames as a 3-D volume, got shape {pixel_data.shape}"
+            )
+        slice_list = [pixel_data[i] for i in range(pixel_data.shape[0])]
+        j2k = prepare_j2k_frames(encode_j2k_lossless_frames(slice_list))
     if j2k is not None:
         if j2k.samples != 1:
             raise ValueError(
@@ -775,24 +801,9 @@ def write_opt_dicom(
         columns = j2k.columns
         _apply_j2k_pixels(ds, j2k)
     else:
-        pixel_data, bits = _encode_pixel_array(frames)
-        if pixel_data.ndim == 2:
-            pixel_data = pixel_data[np.newaxis, ...]
-        if pixel_data.ndim != 3:
-            raise ValueError(
-                f"Expected OCT frames as a 3-D volume, got shape {pixel_data.shape}"
-            )
-        pixel_representation = (
-            1 if np.issubdtype(pixel_data.dtype, np.signedinteger) else 0
+        raise ValueError(
+            "write_opt_dicom requires frames or compressed_frames"
         )
-        _apply_pixel_encoding_tags(
-            ds,
-            bits,
-            pixel_representation=pixel_representation,
-        )
-        n_frames = int(pixel_data.shape[0])
-        rows = int(pixel_data.shape[1])
-        columns = int(pixel_data.shape[2])
     ds.NumberOfFrames = n_frames
     ds.Rows = rows
     ds.Columns = columns
@@ -875,8 +886,6 @@ def write_opt_dicom(
 
         per_frame.append(frame_fgs)
     ds.PerFrameFunctionalGroupsSequence = per_frame
-    if j2k is None:
-        ds.PixelData = _pixel_data_bytes(pixel_data)
     ds.save_as(
         filepath, implicit_vr=False, little_endian=True, enforce_file_format=True
     )
@@ -1192,6 +1201,14 @@ def write_fundus_dicom(
     )
     ds.Modality = "OP"
     j2k = prepare_j2k_frames(list(compressed_frames)) if compressed_frames else None
+    if j2k is None and frames is not None:
+        gray = _as_grayscale_array(frames)
+        pixel_data, _bits = _encode_pixel_array(gray)
+        if pixel_data.ndim != 2:
+            raise ValueError(
+                f"Expected 2-D grayscale fundus image, got shape {pixel_data.shape}"
+            )
+        j2k = prepare_j2k_frames(encode_j2k_lossless_frames([pixel_data]))
     if j2k is not None:
         if j2k.samples != 1:
             raise ValueError(
@@ -1202,13 +1219,7 @@ def write_fundus_dicom(
         rows = j2k.rows
         columns = j2k.columns
     else:
-        pixel_data, bits = _encode_pixel_array(_as_grayscale_array(frames))
-        if pixel_data.ndim != 2:
-            raise ValueError(
-                f"Expected 2-D grayscale fundus image, got shape {pixel_data.shape}"
-            )
-        rows = int(pixel_data.shape[0])
-        columns = int(pixel_data.shape[1])
+        raise ValueError("write_fundus_dicom requires frames or compressed_frames")
     photo_sop = _photography_sop_uid(bits)
     ds.SOPClassUID = photo_sop
     ds.file_meta.MediaStorageSOPClassUID = photo_sop
@@ -1231,17 +1242,7 @@ def write_fundus_dicom(
     )
     _ophthalmic_image_descriptors(ds, monochrome=True)
     _empty_photo_acquisition(ds)
-    if j2k is not None:
-        _apply_j2k_pixels(ds, j2k)
-    else:
-        pixel_representation = (
-            1 if np.issubdtype(pixel_data.dtype, np.signedinteger) else 0
-        )
-        _apply_pixel_encoding_tags(
-            ds,
-            bits,
-            pixel_representation=pixel_representation,
-        )
+    _apply_j2k_pixels(ds, j2k)
     ds.NumberOfFrames = 1
 
     # Multi-frame Functional Groups Module PS3.3 C.7.6.16
@@ -1250,8 +1251,6 @@ def write_fundus_dicom(
     ds.Rows = rows
     ds.Columns = columns
 
-    if j2k is None:
-        ds.PixelData = _pixel_data_bytes(pixel_data)
     ds.save_as(
         filepath, implicit_vr=False, little_endian=True, enforce_file_format=True
     )
@@ -1283,6 +1282,18 @@ def write_color_fundus_dicom(
     ds = populate_opt_series(ds, meta, study_instance_uid=study_instance_uid)
     ds.Modality = "OP"
     j2k = prepare_j2k_frames(list(compressed_frames)) if compressed_frames else None
+    if j2k is None and frames is not None:
+        # Topcon colour FDA is BGR-labeled JP2; callers pass corrected RGB
+        # pixels. Re-encode JPEG 2000 lossless (no MCT → photometric RGB).
+        rgb = np.asarray(frames)
+        if rgb.ndim == 3 and rgb.shape[-1] == 4:
+            rgb = rgb[..., :3]
+        pixel_data, _bits = _encode_pixel_array(rgb)
+        if pixel_data.ndim != 3 or pixel_data.shape[-1] != 3:
+            raise ValueError(
+                f"Expected HxWx3 RGB fundus image, got shape {pixel_data.shape}"
+            )
+        j2k = prepare_j2k_frames(encode_j2k_lossless_frames([pixel_data]))
     if j2k is not None:
         if j2k.samples != 3:
             raise ValueError(
@@ -1293,16 +1304,9 @@ def write_color_fundus_dicom(
         rows = j2k.rows
         columns = j2k.columns
     else:
-        rgb = np.asarray(frames)
-        if rgb.ndim == 3 and rgb.shape[-1] == 4:
-            rgb = rgb[..., :3]
-        pixel_data, bits = _encode_pixel_array(rgb)
-        if pixel_data.ndim != 3 or pixel_data.shape[-1] != 3:
-            raise ValueError(
-                f"Expected HxWx3 RGB fundus image, got shape {pixel_data.shape}"
-            )
-        rows = int(pixel_data.shape[0])
-        columns = int(pixel_data.shape[1])
+        raise ValueError(
+            "write_color_fundus_dicom requires frames or compressed_frames"
+        )
     photo_sop = _photography_sop_uid(bits)
     ds.SOPClassUID = photo_sop
     ds.file_meta.MediaStorageSOPClassUID = photo_sop
@@ -1325,19 +1329,7 @@ def write_color_fundus_dicom(
     )
     _ophthalmic_image_descriptors(ds, monochrome=False)
     _empty_photo_acquisition(ds)
-    if j2k is not None:
-        _apply_j2k_pixels(ds, j2k)
-    else:
-        pixel_representation = (
-            1 if np.issubdtype(pixel_data.dtype, np.signedinteger) else 0
-        )
-        _apply_pixel_encoding_tags(
-            ds,
-            bits,
-            samples_per_pixel=3,
-            photometric="RGB",
-            pixel_representation=pixel_representation,
-        )
+    _apply_j2k_pixels(ds, j2k)
     ds.NumberOfFrames = 1
 
     _photography_timing(ds, meta)
@@ -1345,8 +1337,6 @@ def write_color_fundus_dicom(
     ds.Rows = rows
     ds.Columns = columns
 
-    if j2k is None:
-        ds.PixelData = _pixel_data_bytes(pixel_data)
     ds.save_as(
         filepath, implicit_vr=False, little_endian=True, enforce_file_format=True
     )

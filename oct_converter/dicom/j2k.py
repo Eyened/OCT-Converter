@@ -4,11 +4,19 @@ FDA ``@IMG_JPEG``, ``@IMG_FUNDUS`` and ``@IMG_TRC_02`` chunks hold JPEG 2000
 data, either as a raw codestream or as a JP2 file. DICOM encapsulation uses
 the codestream only (no JP2 wrapper) and must advertise the wavelet the
 codestream actually uses.
+
+Decoded pixel arrays can be re-encoded with :func:`encode_j2k_lossless_frames`
+(OpenJPEG via ``imagecodecs``) for DICOM JPEG 2000 Lossless transfer syntax.
 """
 
 from __future__ import annotations
 
+import os
+import typing as t
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+
+import numpy as np
 
 _SOC = b"\xff\x4f"
 _JP2_BRAND = b"jP  "
@@ -241,3 +249,46 @@ def _bits_allocated(precision: int) -> int:
         if precision <= allocated:
             return allocated
     raise ValueError(f"JPEG 2000 precision {precision} is above 40 bits.")
+
+
+def encode_j2k_lossless_frames(
+    frames: t.Sequence[np.ndarray],
+) -> list[bytes]:
+    """Encode frames as JPEG 2000 lossless (reversible) codestreams.
+
+    Accepts grayscale ``(H, W)`` or colour ``(H, W, 3)`` integer arrays.
+    Colour is encoded without MCT so DICOM photometric interpretation stays
+    ``RGB``. Uses OpenJPEG through ``imagecodecs``.
+    """
+    import imagecodecs
+
+    if not frames:
+        raise ValueError("No frames to encode as JPEG 2000.")
+
+    prepared: list[np.ndarray] = []
+    for index, frame in enumerate(frames):
+        arr = np.ascontiguousarray(frame)
+        if arr.ndim == 2:
+            pass
+        elif arr.ndim == 3 and arr.shape[-1] == 3:
+            pass
+        else:
+            raise ValueError(
+                f"Frame {index} must be HxW or HxWx3, got shape {arr.shape}"
+            )
+        if not np.issubdtype(arr.dtype, np.integer):
+            raise TypeError(
+                f"Frame {index} dtype {arr.dtype} is not an integer type"
+            )
+        prepared.append(arr)
+
+    def _encode(arr: np.ndarray) -> bytes:
+        return bytes(
+            imagecodecs.jpeg2k_encode(arr, level=0, reversible=True, mct=False)
+        )
+
+    if len(prepared) == 1:
+        return [_encode(prepared[0])]
+    workers = min(len(prepared), os.cpu_count() or 1)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(_encode, prepared))

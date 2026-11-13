@@ -27,6 +27,7 @@ dependencies = [
     "matplotlib",
     "imageio-ffmpeg",
     "h5py",
+    "imagecodecs",
 ]
 requires-python = ">=3.7"
 
