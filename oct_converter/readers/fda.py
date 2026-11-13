@@ -12,6 +12,7 @@ from PIL import Image
 
 from oct_converter.image_types import FundusImageWithMetaData, OCTVolumeWithMetaData
 from oct_converter.readers.binary_structs import fda_binary
+from oct_converter.readers.scan_geometry import topcon_pixel_spacing
 
 
 class FDA(object):
@@ -208,14 +209,18 @@ class FDA(object):
                 )
                 f.seek(chunk_loc)
                 scan_params = fda_binary.param_scan_02_header.parse(f.read(chunk_size))
-            pixel_spacing = [
-                scan_params.get("x_dimension_mm")
-                / oct_header.get("width"),  # WidthPixelS, PixelSpacing[1]
-                scan_params.get("y_dimension_mm")
-                / oct_header.get("number_slices"),  # FramePixelS / SliceThickness
-                scan_params.get("z_resolution_um")
-                / 1000,  # zHeightPixelS, PixelSpacing[0]
-            ]
+            x_mm = float(scan_params.get("x_dimension_mm") or 0)
+            y_mm = float(scan_params.get("y_dimension_mm") or 0)
+            oct_header["x_dimension_mm"] = x_mm
+            oct_header["y_dimension_mm"] = y_mm
+            pixel_spacing = topcon_pixel_spacing(
+                oct_header.get("scan_mode"),
+                oct_header.get("width"),
+                oct_header.get("number_slices"),
+                x_mm,
+                y_mm,
+                scan_params.get("z_resolution_um") or 0,
+            )
         return pixel_spacing
 
     def read_fundus_image(self) -> FundusImageWithMetaData:
