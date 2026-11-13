@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import os
 import typing as t
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +15,68 @@ from construct import ListContainer, StreamError
 from oct_converter.image_types import FundusImageWithMetaData, OCTVolumeWithMetaData
 from oct_converter.readers.binary_structs import fda_binary
 from oct_converter.readers.scan_geometry import topcon_pixel_spacing
+
+# @IMG_ANGIOGRAPHY_02 uses the same fixed header size as IMG_MOT_COMP_03.
+_ANGIO_HEADER_SIZE = 22
+
+
+def parse_angiography_chunk(raw: bytes) -> list[np.ndarray]:
+    """Decode an ``@IMG_ANGIOGRAPHY_02`` payload into B-scan frames.
+
+    Topcon IMAGEnet exports the same payload as numbered zip members
+    (``angio_001.zip`` …). Each zip holds one raw uint8 array named
+    ``angio`` with shape ``(n_chunk, height, width)``. Chunks concatenate
+    along the slow-scan axis to match the structural ``@IMG_JPEG`` volume.
+    """
+    if len(raw) < _ANGIO_HEADER_SIZE:
+        raise ValueError(
+            f"Angiography chunk shorter than header ({len(raw)} < {_ANGIO_HEADER_SIZE})"
+        )
+    header = fda_binary.oct_header_2.parse(raw[:_ANGIO_HEADER_SIZE])
+    width = int(header.width)
+    height = int(header.height)
+    n_slices = int(header.number_slices)
+    payload = raw[_ANGIO_HEADER_SIZE:]
+
+    starts: list[int] = []
+    pos = 0
+    while True:
+        found = payload.find(b"PK\x03\x04", pos)
+        if found < 0:
+            break
+        starts.append(found)
+        pos = found + 1
+    if not starts:
+        raise ValueError("No zip archives found in angiography chunk")
+
+    plane = height * width
+    chunks: list[np.ndarray] = []
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(payload)
+        with zipfile.ZipFile(io.BytesIO(payload[start:end])) as zf:
+            names = zf.namelist()
+            if "angio" not in names:
+                raise ValueError(
+                    f"Angiography zip {i + 1} missing 'angio' member, got {names}"
+                )
+            data = zf.read("angio")
+        if len(data) % plane != 0:
+            raise ValueError(
+                f"Angiography zip {i + 1} size {len(data)} is not a multiple of "
+                f"{height}x{width}"
+            )
+        n_chunk = len(data) // plane
+        chunks.append(
+            np.frombuffer(data, dtype=np.uint8).reshape(n_chunk, height, width)
+        )
+
+    volume = np.concatenate(chunks, axis=0)
+    if volume.shape[0] != n_slices:
+        raise ValueError(
+            f"Angiography header lists {n_slices} slices, unzipped {volume.shape[0]}"
+        )
+    return [np.ascontiguousarray(volume[i]) for i in range(volume.shape[0])]
+
 
 def _imdecode(raw: bytes, flags: int = cv2.IMREAD_UNCHANGED) -> np.ndarray:
     """Decode a JPEG or JPEG 2000 payload to an array.
@@ -151,6 +214,10 @@ class FDA(object):
 
         # read all other metadata
         metadata = self.read_all_metadata(verbose=verbose)
+        metadata["oct_angiography"] = (
+            b"@IMG_ANGIOGRAPHY_02" in self.chunk_dict
+            or b"@PARAM_ANGIOGRAPHY" in self.chunk_dict
+        )
         patient_info = metadata.get("patient_info_02") or metadata.get(
             "patient_info", {}
         )
@@ -181,6 +248,33 @@ class FDA(object):
         )
 
         return oct_volume
+
+    def read_angiography_volume(self) -> list[np.ndarray] | None:
+        """Read OCTA flow B-scans from ``@IMG_ANGIOGRAPHY_02``.
+
+        Returns:
+            List of uint8 arrays shaped ``(height, width)``, one per B-scan,
+            or ``None`` when the file has no angiography chunk.
+        """
+        if b"@IMG_ANGIOGRAPHY_02" not in self.chunk_dict:
+            return None
+        with open(self.filepath, "rb") as f:
+            raw = _read_chunk_bytes(f, *self.chunk_dict[b"@IMG_ANGIOGRAPHY_02"])
+        return parse_angiography_chunk(raw)
+
+    def read_angiography_param_bscans_per_frame(self) -> int | None:
+        """Best-effort Number of B-scans Per Frame from ``@PARAM_ANGIOGRAPHY``.
+
+        The first byte of the 12-byte Topcon param block matches the repeat
+        count used for DICOM ``(0022,1642)`` on Triton OCTA cubes (typically 4).
+        """
+        if b"@PARAM_ANGIOGRAPHY" not in self.chunk_dict:
+            return None
+        with open(self.filepath, "rb") as f:
+            raw = _read_chunk_bytes(f, *self.chunk_dict[b"@PARAM_ANGIOGRAPHY"])
+        if not raw:
+            return None
+        return int(raw[0])
 
     def read_oct_data_chunk(self, *, decode: bool = True) -> t.Tuple[list, dict]:
         """Given available chunks, identifies which chunk to utilize

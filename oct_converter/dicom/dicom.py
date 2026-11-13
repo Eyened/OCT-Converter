@@ -15,6 +15,7 @@ from pydicom.uid import (
     ExplicitVRLittleEndian,
     JPEG2000,
     JPEG2000Lossless,
+    OphthalmicOpticalCoherenceTomographyBscanVolumeAnalysisStorage,
     OphthalmicPhotography8BitImageStorage,
     OphthalmicPhotography16BitImageStorage,
     OphthalmicTomographyImageStorage,
@@ -507,6 +508,196 @@ def _opt_multiframe_dimensions(ds: Dataset) -> None:
         _index((0x0020, 0x9056)),  # Stack ID
         _index((0x0020, 0x9057)),  # In-Stack Position Number
     ]
+
+
+def write_oct_bscan_volume_analysis_dicom(
+    meta: DicomMetadata,
+    frames: t.Sequence[np.ndarray],
+    opt_ds: Dataset,
+    filepath: Path,
+    *,
+    bscans_per_frame: int = 1,
+    series_instance_uid: str | None = None,
+    sop_instance_uid: str | None = None,
+) -> FileDataset:
+    """Write Ophthalmic OCT B-scan Volume Analysis (flow / OCTA) DICOM.
+
+    Companion to an Ophthalmic Tomography Image. Shares Study and Frame of
+    Reference UIDs with ``opt_ds``. Modality is ``OPTBSV`` (PS3.3 C.8.17.18).
+    Pixel Representation is signed (IOD requirement); input frames are cast
+    to ``int16``.
+
+    Args:
+        meta: Shared DICOM metadata (patient, geometry, manufacturer).
+        frames: Flow B-scans, one ``(rows, cols)`` array per OPT frame.
+        opt_ds: Structural OPT instance this volume was derived from.
+        filepath: Output ``.dcm`` path.
+        bscans_per_frame: Repeats at each location (``0022,1642``).
+        series_instance_uid: Optional Series Instance UID override.
+        sop_instance_uid: Optional SOP Instance UID override.
+    """
+    if not frames:
+        raise ValueError("Angiography volume has no frames")
+    n_opt = int(getattr(opt_ds, "NumberOfFrames", 1) or 1)
+    if len(frames) != n_opt:
+        raise ValueError(
+            f"Angiography has {len(frames)} frames but OPT has {n_opt}"
+        )
+
+    filepath = Path(filepath)
+    file_meta = FileMetaDataset()
+    file_meta.MediaStorageSOPClassUID = (
+        OphthalmicOpticalCoherenceTomographyBscanVolumeAnalysisStorage
+    )
+    file_meta.MediaStorageSOPInstanceUID = sop_instance_uid or generate_uid()
+    file_meta.ImplementationClassUID = implementation_uid
+    file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    ds = FileDataset(str(filepath), {}, file_meta=file_meta, preamble=b"\0" * 128)
+
+    ds = populate_patient_info(ds, meta)
+    # AcquisitionDeviceTypeCodeSequence is OPT-only; strip after equipment tags.
+    ds = populate_manufacturer_info(ds, meta)
+    if "AcquisitionDeviceTypeCodeSequence" in ds:
+        del ds.AcquisitionDeviceTypeCodeSequence
+
+    # Study / Series — OPTBSV is a separate series from the structural OPT.
+    ds.StudyInstanceUID = opt_ds.StudyInstanceUID
+    ds.SeriesInstanceUID = series_instance_uid or generate_uid()
+    ds.StudyID = meta.series_info.study_id
+    ds.StudyDate = format_dicom_date(meta.series_info.acquisition_date)
+    ds.StudyTime = format_dicom_time(meta.series_info.acquisition_date)
+    ds.ReferringPhysicianName = getattr(opt_ds, "ReferringPhysicianName", "") or ""
+    ds.AccessionNumber = getattr(opt_ds, "AccessionNumber", "") or ""
+    ds.Laterality = meta.series_info.laterality
+    ds.SeriesDescription = meta.series_info.description or "OCTA flow"
+    ds.Modality = "OPTBSV"
+    try:
+        ds.SeriesNumber = int(meta.series_info.series_id) + 1
+    except (TypeError, ValueError):
+        ds.SeriesNumber = int(getattr(opt_ds, "SeriesNumber", 1) or 1) + 1
+
+    ds.SOPClassUID = OphthalmicOpticalCoherenceTomographyBscanVolumeAnalysisStorage
+    ds.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+    ds.FrameOfReferenceUID = opt_ds.FrameOfReferenceUID
+
+    ds = populate_ocular_region(ds, meta)
+
+    # Image module — signed pixels, monochrome flow volume.
+    ds.ImageType = ["ORIGINAL", "PRIMARY"]
+    set_content_date_time(ds, _coerce_datetime(meta.series_info.acquisition_date))
+    ds.InstanceNumber = 1
+    ds.BurnedInAnnotation = "NO"
+    ds.RecognizableVisualFeatures = "NO"
+    ds.PresentationLUTShape = "IDENTITY"
+    ds.LossyImageCompression = "00"
+    ds.ConcatenationFrameOffsetNumber = 0
+    ds.InConcatenationNumber = 1
+    ds.InConcatenationTotalNumber = 1
+
+    signed = [np.ascontiguousarray(np.asarray(f), dtype=np.int16) for f in frames]
+    pixel_data = np.stack(signed, axis=0)
+    _apply_pixel_encoding_tags(ds, 16, pixel_representation=1)
+    # Supplement 197 / PS3.3 A.84.3.1: VOI LUT Module must not be used on this
+    # SOP Class. Windowing lives in Frame VOI LUT With LUT instead.
+    for keyword in ("WindowCenter", "WindowWidth", "WindowCenterWidthExplanation"):
+        if keyword in ds:
+            del ds[keyword]
+    n_frames = int(pixel_data.shape[0])
+    ds.NumberOfFrames = n_frames
+    ds.Rows = int(pixel_data.shape[1])
+    ds.Columns = int(pixel_data.shape[2])
+
+    # Acquisition method — Topcon OCTARA ≈ one-sided ratio (CID 4270).
+    algo = Dataset()
+    algo.AlgorithmFamilyCodeSequence = [
+        _code_dataset("DCM", "128304", "OCT-A one-sided ratio (lesser)")
+    ]
+    algo.AlgorithmName = "OCTARA"
+    algo.AlgorithmVersion = str(meta.manufacturer_info.software_version or "unknown")
+    ds.AcquisitionMethodAlgorithmSequence = [algo]
+
+    if meta.series_info.scan_pattern:
+        scheme, value, meaning = meta.series_info.scan_pattern
+    else:
+        scheme, value, meaning = scan_pattern_code(None, n_frames)
+    slab = float(meta.image_geometry.slice_thickness or 0)
+    acq = Dataset()
+    acq.ScanPatternTypeCodeSequence = [_code_dataset(scheme, value, meaning)]
+    acq.NumberOfBscansPerFrame = max(int(bscans_per_frame), 1)
+    acq.BscanSlabThickness = DSfloat(slab, auto_format=True)
+    acq.DistanceBetweenBscanSlabs = DSfloat(slab, auto_format=True)
+    acq.BscanCycleTime = DSfloat(0, auto_format=True)
+    ds.OCTBscanAnalysisAcquisitionParametersSequence = [acq]
+
+    _opt_multiframe_dimensions(ds)
+
+    # Shared functional groups: anatomy, pixel measures, orientation, VOI LUT.
+    shared = Dataset()
+    shared.FrameAnatomySequence = [Dataset()]
+    shared.FrameAnatomySequence[0].FrameLaterality = meta.series_info.laterality
+    shared.FrameAnatomySequence[0].AnatomicRegionSequence = [
+        ds.AnatomicRegionSequence[0].copy()
+    ]
+    shared.PixelMeasuresSequence = [Dataset()]
+    shared.PixelMeasuresSequence[0].PixelSpacing = meta.image_geometry.pixel_spacing
+    if slab > 0:
+        shared.PixelMeasuresSequence[0].SliceThickness = meta.image_geometry.slice_thickness
+    shared.PlaneOrientationSequence = [Dataset()]
+    shared.PlaneOrientationSequence[0].ImageOrientationPatient = (
+        meta.image_geometry.image_orientation
+    )
+    voi = Dataset()
+    voi.WindowCenter = 0
+    voi.WindowWidth = 1 << 16
+    shared.FrameVOILUTSequence = [voi]
+    ds.SharedFunctionalGroupsSequence = [shared]
+
+    purpose_struct = _code_dataset(
+        "DCM", "128250", "Structural image for imaging processing"
+    )
+    derivation_code = _code_dataset("DCM", "128303", "OCT B-scan analysis")
+
+    per_frame = []
+    for i in range(n_frames):
+        frame_fgs = Dataset()
+        frame_fgs.PlanePositionSequence = [Dataset()]
+        frame_fgs.PlanePositionSequence[0].ImagePositionPatient = [
+            0,
+            0,
+            DSfloat(i * (meta.image_geometry.slice_thickness or 0), auto_format=True),
+        ]
+        frame_fgs.FrameContentSequence = [Dataset()]
+        frame_fgs.FrameContentSequence[0].InStackPositionNumber = i + 1
+        frame_fgs.FrameContentSequence[0].StackID = "1"
+        frame_fgs.FrameContentSequence[0].DimensionIndexValues = [1, i + 1]
+
+        source = Dataset()
+        source.ReferencedSOPClassUID = str(opt_ds.SOPClassUID)
+        source.ReferencedSOPInstanceUID = opt_ds.SOPInstanceUID
+        source.ReferencedFrameNumber = [i + 1]
+        source.PurposeOfReferenceCodeSequence = [purpose_struct]
+        source.SpatialLocationsPreserved = "YES"
+
+        deriv = Dataset()
+        deriv.DerivationCodeSequence = [derivation_code]
+        deriv.SourceImageSequence = [source]
+        frame_fgs.DerivationImageSequence = [deriv]
+
+        ref = Dataset()
+        ref.ReferencedSOPClassUID = str(opt_ds.SOPClassUID)
+        ref.ReferencedSOPInstanceUID = opt_ds.SOPInstanceUID
+        ref.ReferencedFrameNumber = [i + 1]
+        ref.PurposeOfReferenceCodeSequence = [purpose_struct]
+        frame_fgs.ReferencedImageSequence = [ref]
+
+        per_frame.append(frame_fgs)
+    ds.PerFrameFunctionalGroupsSequence = per_frame
+
+    ds.PixelData = _pixel_data_bytes(pixel_data)
+    ds.save_as(
+        filepath, implicit_vr=False, little_endian=True, enforce_file_format=True
+    )
+    return ds
 
 
 def write_opt_dicom(
@@ -1603,6 +1794,10 @@ def create_dicom_from_fda(
     Map Segmentation companion (``{stem}_seg.dcm``) sharing Study and Frame
     of Reference UIDs with the OPT volume.
 
+    When ``@IMG_ANGIOGRAPHY_02`` is present (OCTA), also writes a B-scan
+    Volume Analysis companion (``{stem}_octa.dcm``, SOP ``…77.1.5.8``) with
+    the flow volume linked to the structural OPT.
+
     ``@IMG_JPEG`` and the infrared ``@IMG_TRC_02`` codestreams are encapsulated
     without being decoded. A colour ``@IMG_FUNDUS`` whose components are B, G, R
     is written as uncompressed RGB so photometric interpretation RGB is true.
@@ -1666,6 +1861,24 @@ def create_dicom_from_fda(
         ),
     )
     files.append(opt_path)
+
+    # OCTA flow volume: second SOP (B-scan Volume Analysis), same FoR as OPT.
+    angio = fda.read_angiography_volume()
+    if angio is not None:
+        bscans_per = fda.read_angiography_param_bscans_per_frame() or 1
+        octa_path = Path(output_dir, f"{stem}_octa.dcm")
+        _with_description(
+            meta,
+            "OCTA flow",
+            lambda: write_oct_bscan_volume_analysis_dicom(
+                meta,
+                angio,
+                opt_ds,
+                octa_path,
+                bscans_per_frame=bscans_per,
+            ),
+        )
+        files.append(octa_path)
 
     if oct.contours:
         axial_mm = None
