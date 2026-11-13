@@ -30,6 +30,9 @@ dependencies = [
 ]
 requires-python = ">=3.7"
 
+[project.scripts]
+oct-converter = "oct_converter.cli:run"
+
 [project.urls]
 Homepage = "https://github.com/marksgraham/OCT-Converter"
 
