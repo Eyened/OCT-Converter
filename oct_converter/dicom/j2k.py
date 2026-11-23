@@ -53,6 +53,18 @@ def is_jpeg2000(payload: bytes) -> bool:
     return payload.startswith(_SOC) or payload[4:8] == _JP2_BRAND
 
 
+def is_byte_volume(volume) -> bool:
+    """True when a volume is a list of encoded byte payloads rather than arrays."""
+    return bool(volume) and isinstance(volume[0], (bytes, bytearray))
+
+
+def jpeg2000_volume(volume) -> list[bytes] | None:
+    """JPEG 2000 OCT payloads, or None when the volume is raw pixels."""
+    if not is_byte_volume(volume) or not is_jpeg2000(volume[0]):
+        return None
+    return list(volume)
+
+
 def prepare_j2k_frames(payloads: list[bytes]) -> J2KFrames:
     """Parse FDA image payloads into codestreams with one shared description.
 

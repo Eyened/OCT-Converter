@@ -252,15 +252,20 @@ def fda_dicom_metadata(oct: OCTVolumeWithMetaData) -> DicomMetadata:
     Returns:
         DicomMetadata: Populated DicomMetadata created with OCT metadata
     """
-    meta = DicomMetadata
-    meta.patient_info = fda_patient_meta(oct.metadata)
-    meta.series_info = fda_series_meta(oct.metadata)
-    meta.manufacturer_info = fda_manu_meta(oct.metadata, oct.header)
-    meta.image_geometry = fda_image_geom(oct.pixel_spacing)
-    meta.oct_image_params = fda_image_params(meta.manufacturer_info.manufacturer_model)
+    patient_info = fda_patient_meta(oct.metadata)
+    series_info = fda_series_meta(oct.metadata)
+    manufacturer_info = fda_manu_meta(oct.metadata, oct.header)
+    image_geometry = fda_image_geom(oct.pixel_spacing)
+    oct_image_params = fda_image_params(manufacturer_info.manufacturer_model)
     header = oct.oct_header or {}
     n_frames = int(header.get("number_slices") or 0) or len(oct.volume or [])
-    meta.series_info.scan_pattern = topcon_scan_pattern(header.get("scan_mode"), n_frames)
-    meta.series_info.octa = bool((oct.metadata or {}).get("oct_angiography"))
+    series_info.scan_pattern = topcon_scan_pattern(header.get("scan_mode"), n_frames)
+    series_info.octa = bool((oct.metadata or {}).get("oct_angiography"))
 
-    return meta
+    return DicomMetadata(
+        patient_info=patient_info,
+        series_info=series_info,
+        manufacturer_info=manufacturer_info,
+        image_geometry=image_geometry,
+        oct_image_params=oct_image_params,
+    )
