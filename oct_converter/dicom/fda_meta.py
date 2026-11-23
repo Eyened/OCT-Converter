@@ -104,9 +104,12 @@ def apply_topcon_device_specs(image_params: OCTImageParams, model_name: str) -> 
 
 
 def opt_series_fallback(scan_mode: int | None, octa: bool) -> str:
-    """Series description used when the capture label is empty."""
-    if octa:
-        return "OCTA"
+    """Series description used when the capture label is empty.
+
+    An angiography chunk does not rename the structural OPT. The flow
+    object carries its own description. ``octa`` is accepted so callers
+    that already pass the flag keep a stable signature.
+    """
     mode = int(scan_mode) if scan_mode is not None else -1
     return {0: "Line", 1: "Circle", 3: "Radial", 4: "Cross", 11: "Cross"}.get(
         mode, "OCT"
@@ -214,20 +217,42 @@ def _software_version(fda_metadata: dict, fda_header: dict) -> str:
     return ""
 
 
-def fda_image_geom(pixel_spacing: list) -> ImageGeometry:
+_CROSS_SCAN_MODES = {4, 11}
+
+
+def topcon_image_geometry(pixel_spacing: list, scan_mode: int | None) -> ImageGeometry:
+    """Image geometry from ``topcon_pixel_spacing`` and the IMG scan mode.
+
+    ``pixel_spacing`` is ``[lateral mm, stack step or line gap mm, axial mm]``.
+    DICOM Pixel Spacing is ``[axial, lateral]``. The middle value is slice
+    thickness for a rectangular stack. For a cross scan it is the gap between
+    lines and is stored as ``spacing_between_slices`` instead.
+    """
+    image_geom = ImageGeometry()
+    image_geom.pixel_spacing = [pixel_spacing[2], pixel_spacing[0]]
+    image_geom.image_orientation = [1, 0, 0, 0, 1, 0]
+    step = float(pixel_spacing[1] or 0)
+    mode = int(scan_mode) if scan_mode is not None else -1
+    if mode in _CROSS_SCAN_MODES:
+        image_geom.slice_thickness = 0.0
+        image_geom.spacing_between_slices = step if step > 0 else 0.0
+    else:
+        image_geom.slice_thickness = step
+        image_geom.spacing_between_slices = 0.0
+    return image_geom
+
+
+def fda_image_geom(pixel_spacing: list, scan_mode: int | None = None) -> ImageGeometry:
     """Creates ImageGeometry from FDA metadata
 
     Args:
         pixel_spacing: Pixel spacing calculated in the fda reader
+        scan_mode: IMG-header scan mode. Cross modes store the middle
+            spacing value as a line gap rather than a slice thickness.
     Returns:
         ImageGeometry: Geometry data populated by pixel_spacing
     """
-    image_geom = ImageGeometry()
-    image_geom.pixel_spacing = [pixel_spacing[2], pixel_spacing[0]]
-    image_geom.slice_thickness = pixel_spacing[1]
-    image_geom.image_orientation = [1, 0, 0, 0, 1, 0]
-
-    return image_geom
+    return topcon_image_geometry(pixel_spacing, scan_mode)
 
 
 def fda_image_params(model_name: str) -> OCTImageParams:
@@ -255,11 +280,12 @@ def fda_dicom_metadata(oct: OCTVolumeWithMetaData) -> DicomMetadata:
     patient_info = fda_patient_meta(oct.metadata)
     series_info = fda_series_meta(oct.metadata)
     manufacturer_info = fda_manu_meta(oct.metadata, oct.header)
-    image_geometry = fda_image_geom(oct.pixel_spacing)
-    oct_image_params = fda_image_params(manufacturer_info.manufacturer_model)
     header = oct.oct_header or {}
+    image_geometry = fda_image_geom(oct.pixel_spacing, header.get("scan_mode"))
+    oct_image_params = fda_image_params(manufacturer_info.manufacturer_model)
     n_frames = int(header.get("number_slices") or 0) or len(oct.volume or [])
     series_info.scan_pattern = topcon_scan_pattern(header.get("scan_mode"), n_frames)
+    series_info.scan_pattern_specified = True
     series_info.octa = bool((oct.metadata or {}).get("oct_angiography"))
 
     return DicomMetadata(

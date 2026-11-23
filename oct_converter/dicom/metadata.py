@@ -100,8 +100,11 @@ class SeriesMeta:
     # Scan
     protocol: str = ""
     description: str = ""
-    # CID 4272 (scheme, code, meaning). Empty means the writer infers one.
+    # CID 4272 (scheme, code, meaning). Empty means the writer infers one,
+    # unless ``scan_pattern_specified`` is set, in which case the sequence
+    # is omitted rather than guessed.
     scan_pattern: tuple[str, str, str] | None = None
+    scan_pattern_specified: bool = False
     # Structural B-scans captured as part of an OCT angiography scan.
     octa: bool = False
 
@@ -121,6 +124,8 @@ class ImageGeometry:
     pixel_spacing: list[float] = field(default_factory=list)
     slice_thickness: float = 1.0
     image_orientation: list[float] = field(default_factory=list)
+    # Gap between parallel lines (cross scans). Not a slab thickness.
+    spacing_between_slices: float = 0.0
 
 
 @dataclasses.dataclass

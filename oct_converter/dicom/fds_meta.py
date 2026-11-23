@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from oct_converter.dicom.fda_meta import apply_topcon_device_specs, _model_name
+from oct_converter.dicom.fda_meta import (
+    apply_topcon_device_specs,
+    topcon_image_geometry,
+    _model_name,
+)
 from oct_converter.dicom.metadata import (
     DicomMetadata,
     ImageGeometry,
@@ -92,20 +96,13 @@ def fds_manu_meta(fds_metadata: dict, fds_header: dict) -> ManufacturerMeta:
     return manufacture
 
 
-def fds_image_geom(pixel_spacing: list) -> ImageGeometry:
-    """Creates ImageGeometry from FDS metadata
+def fds_image_geom(pixel_spacing: list, scan_mode: int | None = None) -> ImageGeometry:
+    """Creates ImageGeometry from FDS metadata.
 
-    Args:
-        pixel_spacing: Pixel spacing calculated in the fds reader
-    Returns:
-        ImageGeometry: Geometry data populated by pixel_spacing
+    Same axis rules as FDA: vertical cubes swap the field sizes, and a
+    cross-scan gap is not stored as slice thickness.
     """
-    image_geom = ImageGeometry()
-    image_geom.pixel_spacing = [pixel_spacing[2], pixel_spacing[0]]
-    image_geom.slice_thickness = pixel_spacing[1]
-    image_geom.image_orientation = [1, 0, 0, 0, 1, 0]
-
-    return image_geom
+    return topcon_image_geometry(pixel_spacing, scan_mode)
 
 
 def fds_image_params(model_name: str) -> OCTImageParams:
@@ -132,11 +129,12 @@ def fds_dicom_metadata(oct: OCTVolumeWithMetaData) -> DicomMetadata:
     patient_info = fds_patient_meta(oct.metadata)
     series_info = fds_series_meta(oct.metadata)
     manufacturer_info = fds_manu_meta(oct.metadata, oct.header)
-    image_geometry = fds_image_geom(oct.pixel_spacing)
-    oct_image_params = fds_image_params(manufacturer_info.manufacturer_model)
     header = oct.oct_header or {}
+    image_geometry = fds_image_geom(oct.pixel_spacing, header.get("scan_mode"))
+    oct_image_params = fds_image_params(manufacturer_info.manufacturer_model)
     n_frames = int(header.get("number_slices") or 0) or len(oct.volume or [])
     series_info.scan_pattern = topcon_scan_pattern(header.get("scan_mode"), n_frames)
+    series_info.scan_pattern_specified = True
 
     return DicomMetadata(
         patient_info=patient_info,

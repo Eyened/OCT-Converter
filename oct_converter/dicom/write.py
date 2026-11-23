@@ -10,7 +10,7 @@ import typing as t
 from collections import defaultdict
 from pathlib import Path
 
-from oct_converter.dicom.metadata import DicomMetadata
+from oct_converter.dicom.metadata import DicomMetadata, PatientMeta
 from oct_converter.dicom.study import DicomStudy, ExportPhoto
 
 
@@ -20,11 +20,14 @@ def write_dicom_study(
     *,
     meta: DicomMetadata | None = None,
     overrides: t.Mapping[str, t.Any] | None = None,
+    patient: PatientMeta | None = None,
 ) -> list[Path]:
     """Write every photo, OPT, OCTA volume, and segmentation in ``study``.
 
     ``meta``, when given, replaces each object's parsed metadata. ``overrides``
-    are applied to a copy. The objects on ``study`` are not modified.
+    are applied to a copy. ``patient`` fills Patient ID, name, sex, and birth
+    date only where that copy is still empty. The objects on ``study`` are
+    not modified.
     One Study Instance UID is shared by every file. ``localizer_geometry`` is
     applied after that copy so a replacement ``meta`` still carries the scan.
     """
@@ -33,6 +36,7 @@ def write_dicom_study(
         _with_acquisition_device,
         _with_description,
         _without_opt_image_plane,
+        fill_empty_patient,
         write_color_fundus_dicom,
         write_fundus_dicom,
         write_heightmap_seg_dicom,
@@ -53,6 +57,7 @@ def write_dicom_study(
         working, shared_study, plan = _begin_export(
             built, supplied, overrides, study_instance_uid=shared_study
         )
+        fill_empty_patient(working, patient)
         return working
 
     def series_uid(role: str) -> str | None:

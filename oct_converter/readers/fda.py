@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import os
+import struct
 import typing as t
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -37,29 +38,103 @@ def parse_angiography_chunk(raw: bytes) -> list[np.ndarray]:
     height = int(header.height)
     n_slices = int(header.number_slices)
     payload = raw[_ANGIO_HEADER_SIZE:]
+    zipped = _angiography_from_zips(payload, width, height, n_slices)
+    if zipped is not None:
+        return zipped
+    return _angiography_from_encoded_slices(payload, n_slices)
 
-    starts: list[int] = []
+
+def _angio_zip_end(payload: bytes, start: int) -> int | None:
+    """End offset of one IMAGEnet ``angio`` zip, or ``None`` if ``start`` is not one.
+
+    Boundaries come from the local header's compressed size. Deflate streams
+    can contain ``PK\\x03\\x04``; treating every marker as the next zip
+    truncates the member and drops the remaining slices.
+    """
+    if start < 0 or payload[start : start + 4] != b"PK\x03\x04" or start + 30 > len(payload):
+        return None
+    (
+        _ver,
+        flag,
+        method,
+        _time,
+        _date,
+        _crc,
+        csize,
+        _usize,
+        nlen,
+        elen,
+    ) = struct.unpack_from("<HHHHHIIIHH", payload, start + 4)
+    if flag & 0x8 or method not in (0, 8) or nlen != 5 or elen > 1024:
+        return None
+    name_at = start + 30
+    if payload[name_at : name_at + nlen] != b"angio":
+        return None
+    data_end = name_at + nlen + elen + csize
+    if csize <= 0 or data_end + 4 > len(payload) or payload[data_end : data_end + 4] != b"PK\x01\x02":
+        return None
+    eocd = payload.find(b"PK\x05\x06", data_end)
+    if eocd < 0 or eocd + 22 > len(payload):
+        return None
+    next_local = payload.find(b"PK\x03\x04", data_end)
+    if next_local != -1 and next_local < eocd:
+        return None
+    _entries_disk, total_entries, cd_size, cd_offset, comment_len = struct.unpack_from(
+        "<HHIIH", payload, eocd + 8
+    )
+    if (
+        total_entries != 1
+        or start + cd_offset != data_end
+        or cd_size != eocd - data_end
+        or eocd + 22 + comment_len > len(payload)
+    ):
+        return None
+    return eocd + 22 + comment_len
+
+
+def _angiography_zip_spans(payload: bytes) -> list[tuple[int, int]]:
+    """Spans of concatenated ``angio`` zips. Embedded PK markers are skipped."""
+    spans: list[tuple[int, int]] = []
     pos = 0
-    while True:
-        found = payload.find(b"PK\x03\x04", pos)
-        if found < 0:
+    while pos < len(payload):
+        start = payload.find(b"PK\x03\x04", pos)
+        if start < 0:
             break
-        starts.append(found)
-        pos = found + 1
-    if not starts:
-        raise ValueError("No zip archives found in angiography chunk")
+        end = _angio_zip_end(payload, start)
+        if end is None:
+            pos = start + 1
+            continue
+        spans.append((start, end))
+        pos = end
+    return spans
+
+
+def _angiography_from_zips(
+    payload: bytes, width: int, height: int, n_slices: int
+) -> list[np.ndarray] | None:
+    """Unzip IMAGEnet ``angio`` members, or ``None`` when the payload is not a zip."""
+    spans = _angiography_zip_spans(payload)
+    if not spans:
+        return None
 
     plane = height * width
     chunks: list[np.ndarray] = []
-    for i, start in enumerate(starts):
-        end = starts[i + 1] if i + 1 < len(starts) else len(payload)
-        with zipfile.ZipFile(io.BytesIO(payload[start:end])) as zf:
-            names = zf.namelist()
-            if "angio" not in names:
-                raise ValueError(
-                    f"Angiography zip {i + 1} missing 'angio' member, got {names}"
-                )
-            data = zf.read("angio")
+    for i, (start, end) in enumerate(spans):
+        try:
+            with zipfile.ZipFile(io.BytesIO(payload[start:end])) as zf:
+                names = zf.namelist()
+                if "angio" not in names:
+                    raise ValueError(
+                        f"Angiography zip {i + 1} missing 'angio' member, got {names}"
+                    )
+                data = zf.read("angio")
+        except zipfile.BadZipFile:
+            # A marker that looked like a zip, or a payload that is not a zip
+            # at all. Keep slices already unzipped; otherwise the caller
+            # decodes JPEG/PNG B-scans.
+            if chunks:
+                break
+            return None
         if len(data) % plane != 0:
             raise ValueError(
                 f"Angiography zip {i + 1} size {len(data)} is not a multiple of "
@@ -76,6 +151,26 @@ def parse_angiography_chunk(raw: bytes) -> list[np.ndarray]:
             f"Angiography header lists {n_slices} slices, unzipped {volume.shape[0]}"
         )
     return [np.ascontiguousarray(volume[i]) for i in range(volume.shape[0])]
+
+
+def _angiography_from_encoded_slices(payload: bytes, n_slices: int) -> list[np.ndarray]:
+    """Size-prefixed JPEG or PNG B-scans, the same layout as ``@IMG_JPEG``."""
+    raw_slices: list[bytes] = []
+    pos = 0
+    for index in range(n_slices):
+        if pos + 4 > len(payload):
+            raise ValueError(
+                f"Angiography payload is not a zip and ended before slice {index + 1}"
+            )
+        size = int.from_bytes(payload[pos : pos + 4], "little", signed=True)
+        pos += 4
+        if size <= 0 or pos + size > len(payload):
+            raise ValueError(
+                f"Angiography slice {index + 1} has invalid size {size}"
+            )
+        raw_slices.append(payload[pos : pos + size])
+        pos += size
+    return _decode_slices(raw_slices)
 
 
 def _imdecode(raw: bytes, flags: int = cv2.IMREAD_UNCHANGED) -> np.ndarray:

@@ -66,6 +66,53 @@ def test_parse_angiography_chunk_concatenates_zip_slices():
     np.testing.assert_array_equal(frames[3], chunk1[1])
 
 
+def test_parse_angiography_chunk_ignores_pk_marker_inside_stored_zip():
+    """A PK\\x03\\x04 inside zip data is not the next archive.
+
+    Large Topcon cubes store the signature in compressed bytes. Cutting the
+    payload at every marker truncates that zip and drops the remaining slices.
+    """
+    height, width = 4, 8
+    chunk0 = np.arange(2 * height * width, dtype=np.uint8).reshape(2, height, width)
+    chunk1 = (chunk0 + 40).astype(np.uint8).copy()
+    # Signature lands in the second archive, after the first has already unzipped.
+    chunk1.ravel()[3:7] = np.frombuffer(b"PK\x03\x04", dtype=np.uint8)
+
+    def stored(frames: np.ndarray) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+            zf.writestr("angio", np.ascontiguousarray(frames).tobytes())
+        return buf.getvalue()
+
+    raw = _angio_header(width, height, 4) + stored(chunk0) + stored(chunk1)
+    frames = parse_angiography_chunk(raw)
+
+    assert len(frames) == 4
+    np.testing.assert_array_equal(frames[0], chunk0[0])
+    np.testing.assert_array_equal(frames[2], chunk1[0])
+    np.testing.assert_array_equal(frames[3], chunk1[1])
+
+
+def test_parse_angiography_chunk_decodes_non_zip_images():
+    import cv2
+
+    height, width = 5, 4
+    frame = np.arange(height * width, dtype=np.uint8).reshape(height, width)
+    ok, encoded = cv2.imencode(".png", frame)
+    assert ok
+    blob = encoded.tobytes()
+    payload = struct.pack("<i", len(blob)) + blob
+    # A PK marker that is not a zip. The reader must not abort on BadZipFile.
+    payload += b"PK\x03\x04not-a-zip"
+    raw = _angio_header(width, height, 1) + payload
+
+    frames = parse_angiography_chunk(raw)
+
+    assert len(frames) == 1
+    assert frames[0].shape == (height, width)
+    np.testing.assert_array_equal(frames[0], frame)
+
+
 def test_parse_angiography_chunk_rejects_empty():
     with pytest.raises(ValueError, match="header"):
         parse_angiography_chunk(b"\x00" * 10)

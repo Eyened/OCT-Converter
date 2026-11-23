@@ -371,13 +371,18 @@ SCAN_PATTERN_CIRCLE = ("DCM", "128284", "Circle B-scan pattern")
 # 0 line, 1 circle, 2 rectangular 3D (including OCTA cubes), 3 radial,
 # 4 two-line cross, 6 vertical 3D, 11 five-line cross.
 _TOPCON_VOLUME_MODES = {2, 6}
-_TOPCON_LINE_LIKE_MODES = {0, 3, 4, 11}
 
 
 def topcon_scan_pattern(
     scan_mode: int | None, num_frames: int = 1
-) -> tuple[str, str, str]:
-    """CID 4272 code for a Topcon IMG-header scan mode."""
+) -> tuple[str, str, str] | None:
+    """CID 4272 code for a Topcon IMG-header scan mode.
+
+    Cube is only a rectangular parallel stack (modes 2 and 6). An
+    unrecognised mode, including Web and Raster integers that are not in
+    the known list, returns ``None`` so the writer omits the code. Frame
+    count is not evidence of a cube.
+    """
     mode = int(scan_mode) if scan_mode is not None else -1
     if mode == 0:
         return SCAN_PATTERN_LINE
@@ -389,9 +394,7 @@ def topcon_scan_pattern(
         return SCAN_PATTERN_CROSS
     if mode in _TOPCON_VOLUME_MODES:
         return SCAN_PATTERN_CUBE
-    if int(num_frames or 1) > 1:
-        return SCAN_PATTERN_CUBE
-    return SCAN_PATTERN_LINE
+    return None
 
 
 def topcon_pixel_spacing(
@@ -402,13 +405,18 @@ def topcon_pixel_spacing(
     y_mm: float,
     z_um: float,
 ) -> list[float]:
-    """Pixel spacing as [lateral mm, slice step mm, axial mm].
+    """Pixel spacing as [lateral mm, slice step or line gap mm, axial mm].
 
-    A rectangular stack (3D or vertical 3D) steps ``y_mm`` across ``n - 1``
-    intervals. A circle stores its radius in ``x_mm``, so the A-scan step is
-    the circumference divided by the width. Line, radial, and cross scans
-    have no stack interval; their ``y_mm`` is either zero or the gap between
-    parallel lines, not a slice thickness.
+    The FDA keeps the fundus horizontal size in ``x_mm`` and the vertical
+    size in ``y_mm``. A horizontal cube (mode 2) uses ``x`` along the B-scan
+    and ``y`` across the stack. A vertical cube (mode 6) swaps those two.
+    The stack step is that field divided by ``n - 1``.
+
+    A circle stores its radius in ``x_mm``, so the A-scan step is the
+    circumference divided by the width. Line and radial scans have no
+    millimetre stack. Modes 4 and 11 are parallel lines: ``y_mm`` is the
+    gap across the set, returned in the middle element, and is not a slab
+    thickness. That gap is 0 when there is only one line or ``y_mm`` is 0.
     """
     columns = max(int(width or 1), 1)
     slices = max(int(number_slices or 1), 1)
@@ -417,9 +425,14 @@ def topcon_pixel_spacing(
     if mode == 1:
         lateral = (2.0 * math.pi * float(x_mm)) / columns
         return [lateral, 0.0, axial]
-    if mode in _TOPCON_LINE_LIKE_MODES:
+    if mode in (4, 11):
+        gap = float(y_mm) / (slices - 1) if slices > 1 and float(y_mm) > 0 else 0.0
+        return [float(x_mm) / columns, gap, axial]
+    if mode in (0, 3):
         return [float(x_mm) / columns, 0.0, axial]
     steps = max(slices - 1, 1)
+    if mode == 6:
+        return [float(y_mm) / columns, float(x_mm) / steps, axial]
     return [float(x_mm) / columns, float(y_mm) / steps, axial]
 
 

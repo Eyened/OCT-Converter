@@ -35,6 +35,7 @@ from oct_converter.dicom.metadata import (
     DicomMetadata,
     OCTDetectorType,
     OPTAcquisitionDevice,
+    PatientMeta,
 )
 from oct_converter.dicom.parse import (
     read_boct_study,
@@ -125,6 +126,42 @@ def opt_base_dicom(filepath: Path) -> Dataset:
     return ds
 
 
+def _blank(value: t.Any) -> bool:
+    if value is None:
+        return True
+    return str(value).strip() == ""
+
+
+def fill_empty_patient(meta: DicomMetadata, patient: PatientMeta | None) -> None:
+    """Fill patient attributes the source left empty.
+
+    A non-empty value already on ``meta`` is kept. ``patient`` is not modified.
+    """
+    if patient is None:
+        return
+    dest = meta.patient_info
+    if _blank(dest.patient_id) and not _blank(patient.patient_id):
+        dest.patient_id = str(patient.patient_id).strip()
+    source_has_name = not _blank(dest.first_name) or not _blank(dest.last_name)
+    supplied_has_name = not _blank(patient.first_name) or not _blank(patient.last_name)
+    if not source_has_name and supplied_has_name:
+        dest.first_name = patient.first_name or ""
+        dest.last_name = patient.last_name or ""
+    if _blank(dest.patient_sex) and not _blank(patient.patient_sex):
+        dest.patient_sex = str(patient.patient_sex).strip()
+    if dest.patient_dob is None and patient.patient_dob is not None:
+        dest.patient_dob = patient.patient_dob
+
+
+def _positive_series_number(series_id: t.Any, default: int = 1) -> int:
+    """Series Number from a session id. Missing or non-positive becomes ``default``."""
+    try:
+        number = int(series_id)
+    except (TypeError, ValueError):
+        return default
+    return number if number > 0 else default
+
+
 def populate_patient_info(ds: Dataset, meta: DicomMetadata) -> Dataset:
     """Populates Patient Module PS3.3 C.7.1.1
 
@@ -134,6 +171,8 @@ def populate_patient_info(ds: Dataset, meta: DicomMetadata) -> Dataset:
     Returns:
             ds: Dataset, updated with patient information
     """
+    # Defined character set before any person name or other text.
+    ds.SpecificCharacterSet = "ISO_IR 192"
     # Patient Module PS3.3 C.7.1.1
     last = meta.patient_info.last_name or ""
     first = meta.patient_info.first_name or ""
@@ -234,10 +273,7 @@ def populate_opt_series(
     ds.SeriesDescription = meta.series_info.description
     # Ophthalmic Tomography Series PS3.3 C.8.17.6
     ds.Modality = "OPT"
-    try:
-        ds.SeriesNumber = int(meta.series_info.series_id)
-    except (TypeError, ValueError):
-        ds.SeriesNumber = 1
+    ds.SeriesNumber = _positive_series_number(meta.series_info.series_id)
 
     # SOP Common module PS3.3 C.12.1
     ds.SOPClassUID = OphthalmicTomographyImageStorage
@@ -276,14 +312,7 @@ def opt_shared_functional_groups(ds: Dataset, meta: DicomMetadata) -> Dataset:
     ]
     # Pixel Measures PS3.3 C.7.6.16.2.1
     shared_ds[0].PixelMeasuresSequence = [Dataset()]
-    shared_ds[0].PixelMeasuresSequence[
-        0
-    ].PixelSpacing = meta.image_geometry.pixel_spacing
-    # A line, circle, or cross has no stack interval. Zero is not a thickness.
-    if meta.image_geometry.slice_thickness and meta.image_geometry.slice_thickness > 0:
-        shared_ds[0].PixelMeasuresSequence[
-            0
-        ].SliceThickness = meta.image_geometry.slice_thickness
+    _apply_pixel_measures(shared_ds[0].PixelMeasuresSequence[0], meta)
     # Plane Orientation PS3.3 C.7.6.16.2.4
     shared_ds[0].PlaneOrientationSequence = [Dataset()]
     shared_ds[0].PlaneOrientationSequence[
@@ -291,6 +320,64 @@ def opt_shared_functional_groups(ds: Dataset, meta: DicomMetadata) -> Dataset:
     ].ImageOrientationPatient = meta.image_geometry.image_orientation
     ds.SharedFunctionalGroupsSequence = shared_ds
     return ds
+
+
+def _apply_pixel_measures(measures: Dataset, meta: DicomMetadata) -> None:
+    """Pixel Spacing, and either slice thickness or the cross-scan gap.
+
+    A positive slice thickness is a rectangular stack. A positive
+    ``spacing_between_slices`` is the gap between parallel lines and is
+    written as Spacing Between Slices. Zero is not written for either.
+    """
+    measures.PixelSpacing = meta.image_geometry.pixel_spacing
+    thickness = float(meta.image_geometry.slice_thickness or 0)
+    gap = float(meta.image_geometry.spacing_between_slices or 0)
+    if thickness > 0:
+        measures.SliceThickness = meta.image_geometry.slice_thickness
+    elif gap > 0:
+        measures.SpacingBetweenSlices = gap
+
+
+def _resolved_scan_pattern(
+    meta: DicomMetadata, n_frames: int
+) -> tuple[str, str, str] | None:
+    """CID 4272 for this dataset, or ``None`` when the code must be omitted."""
+    if meta.series_info.scan_pattern:
+        return meta.series_info.scan_pattern
+    if meta.series_info.scan_pattern_specified:
+        return None
+    geom = meta.scan_geometry
+    return scan_pattern_code(
+        (
+            ScanGeometry(
+                scan_type=geom.scan_type if geom else "volume",
+                start_angle=geom.start_angle if geom else None,
+                centre=tuple(geom.centre) if geom and geom.centre else None,
+                radius=geom.radius if geom else None,
+            )
+            if geom
+            else None
+        ),
+        n_frames,
+    )
+
+
+def _volumetric_properties_flag(meta: DicomMetadata, n_frames: int) -> str:
+    """YES only for a rectangular cube with a real stack interval."""
+    pattern = _resolved_scan_pattern(meta, n_frames)
+    thickness = float(meta.image_geometry.slice_thickness or 0)
+    if pattern and pattern[1] == "128279" and thickness > 0:
+        return "YES"
+    return "NO"
+
+
+def _assign_scan_pattern(ds: Dataset, meta: DicomMetadata, n_frames: int) -> None:
+    """Write CID 4272 when a pattern is known. Do not guess a cube."""
+    pattern = _resolved_scan_pattern(meta, n_frames)
+    if pattern is None:
+        return
+    scheme, value, meaning = pattern
+    ds.ScanPatternTypeCodeSequence = [_code_dataset(scheme, value, meaning)]
 
 
 def _encode_pixel_array(arr: np.ndarray) -> tuple[np.ndarray, int]:
@@ -576,8 +663,12 @@ def write_oct_bscan_volume_analysis_dicom(
     ds.SeriesDescription = meta.series_info.description or "OCTA flow"
     ds.Modality = "OPTBSV"
     try:
-        ds.SeriesNumber = int(meta.series_info.series_id) + 1
+        number = int(meta.series_info.series_id)
     except (TypeError, ValueError):
+        number = 0
+    if number > 0:
+        ds.SeriesNumber = number + 1
+    else:
         ds.SeriesNumber = int(getattr(opt_ds, "SeriesNumber", 1) or 1) + 1
 
     ds.SOPClassUID = OphthalmicOpticalCoherenceTomographyBscanVolumeAnalysisStorage
@@ -631,13 +722,12 @@ def write_oct_bscan_volume_analysis_dicom(
     algo.AlgorithmVersion = str(meta.manufacturer_info.software_version or "unknown")
     ds.AcquisitionMethodAlgorithmSequence = [algo]
 
-    if meta.series_info.scan_pattern:
-        scheme, value, meaning = meta.series_info.scan_pattern
-    else:
-        scheme, value, meaning = scan_pattern_code(None, n_frames)
     slab = float(meta.image_geometry.slice_thickness or 0)
     acq = Dataset()
-    acq.ScanPatternTypeCodeSequence = [_code_dataset(scheme, value, meaning)]
+    pattern = _resolved_scan_pattern(meta, n_frames)
+    if pattern is not None:
+        scheme, value, meaning = pattern
+        acq.ScanPatternTypeCodeSequence = [_code_dataset(scheme, value, meaning)]
     acq.NumberOfBscansPerFrame = max(int(bscans_per_frame), 1)
     acq.BscanSlabThickness = DSfloat(slab, auto_format=True)
     acq.DistanceBetweenBscanSlabs = DSfloat(slab, auto_format=True)
@@ -654,9 +744,7 @@ def write_oct_bscan_volume_analysis_dicom(
         ds.AnatomicRegionSequence[0].copy()
     ]
     shared.PixelMeasuresSequence = [Dataset()]
-    shared.PixelMeasuresSequence[0].PixelSpacing = meta.image_geometry.pixel_spacing
-    if slab > 0:
-        shared.PixelMeasuresSequence[0].SliceThickness = meta.image_geometry.slice_thickness
+    _apply_pixel_measures(shared.PixelMeasuresSequence[0], meta)
     shared.PlaneOrientationSequence = [Dataset()]
     shared.PlaneOrientationSequence[0].ImageOrientationPatient = (
         meta.image_geometry.image_orientation
@@ -760,19 +848,14 @@ def write_opt_dicom(
     ds.FrameOfReferenceUID = frame_of_reference_uid or generate_uid()
 
     # OPT Image Module PS3.3 C.8.17.7
+    # Values 1 and 2 are the defined pair. The flow volume is a separate SOP
+    # (Supplement 197 B-scan Volume Analysis); do not mark the structural
+    # OPT with a non-coded ANGIO value.
     ds.ImageType = ["ORIGINAL", "PRIMARY"]
-    # Value 3 distinguishes an angiography acquisition from a structural cube.
-    # Both are still a cube in CID 4272; the flow volume is a separate object
-    # (Supplement 197 B-scan Volume Analysis, SOP …77.1.5.8).
-    if meta.series_info.octa:
-        ds.ImageType.append("ANGIO")
     ds.AcquisitionDateTime = format_acquisition_datetime(
         meta.series_info.acquisition_date
     )
     ds.AcquisitionNumber = 1
-    # Supplement 197: YES when FoR / plane macros make the OPT usable as the
-    # source for B-scan Volume Analysis or surface segmentation.
-    ds.OphthalmicVolumetricPropertiesFlag = "YES"
     _ophthalmic_image_descriptors(ds, monochrome=True)
     _empty_opt_acquisition(ds)
     _opt_multiframe_dimensions(ds)
@@ -806,6 +889,8 @@ def write_opt_dicom(
     ds.NumberOfFrames = n_frames
     ds.Rows = rows
     ds.Columns = columns
+    # Type 1. YES for a rectangular cube with a positive slice thickness.
+    ds.OphthalmicVolumetricPropertiesFlag = _volumetric_properties_flag(meta, n_frames)
 
     # Multi-frame Functional Groups Module PS3.3 C.7.6.16
     # Content time is the acquisition of the B-scans, not when we wrote the file.
@@ -814,23 +899,7 @@ def write_opt_dicom(
 
     # Scan Pattern Type (CID 4272) — Ophthalmic Tomography Parameters
     geom = meta.scan_geometry
-    if meta.series_info.scan_pattern:
-        scheme, value, meaning = meta.series_info.scan_pattern
-    else:
-        scheme, value, meaning = scan_pattern_code(
-            (
-                ScanGeometry(
-                    scan_type=geom.scan_type if geom else "volume",
-                    start_angle=geom.start_angle if geom else None,
-                    centre=tuple(geom.centre) if geom and geom.centre else None,
-                    radius=geom.radius if geom else None,
-                )
-                if geom
-                else None
-            ),
-            n_frames,
-        )
-    ds.ScanPatternTypeCodeSequence = [_code_dataset(scheme, value, meaning)]
+    _assign_scan_pattern(ds, meta, n_frames)
 
     per_frame = []
     for i in range(n_frames):
@@ -988,10 +1057,7 @@ def write_heightmap_seg_dicom(
     ds.SeriesInstanceUID = series_instance_uid or generate_uid()
     ds.FrameOfReferenceUID = opt_ds.FrameOfReferenceUID
     ds.Modality = "SEG"
-    try:
-        ds.SeriesNumber = int(meta.series_info.series_id) + 1000
-    except (TypeError, ValueError):
-        ds.SeriesNumber = 1000
+    ds.SeriesNumber = _positive_series_number(meta.series_info.series_id, default=0) + 1000
     ds.Laterality = meta.series_info.laterality
     ds.SeriesDescription = (
         f"{meta.series_info.description} Height Map Segmentation"
@@ -1425,6 +1491,7 @@ def create_dicom_from_oct(
     *,
     meta: DicomMetadata | None = None,
     overrides: t.Mapping[str, t.Any] | None = None,
+    patient: PatientMeta | None = None,
 ) -> list:
     """Creates a DICOM file with the data parsed from
     the input file.
@@ -1452,6 +1519,9 @@ def create_dicom_from_oct(
                 is a UID for the structural OPT, or a dict of roles
                 ``opt``, ``fundus``, ``fundus_grayscale``, ``octa``, and
                 ``seg`` to a UID or a list of UIDs. See ``prepare_export``.
+            patient: Optional patient module used only to fill attributes
+                the file left empty. A non-empty value from the file wins.
+                ``StudyID`` is not taken from this object.
 
     Returns:
             list: list of Path(s) to DICOM file
@@ -1473,7 +1543,9 @@ def create_dicom_from_oct(
         slice_thickness=slice_thickness,
         apply_registration=apply_registration,
     )
-    return write_dicom_study(study, output_dir, meta=meta, overrides=overrides)
+    return write_dicom_study(
+        study, output_dir, meta=meta, overrides=overrides, patient=patient
+    )
 
 
 def create_dicom_from_boct(
@@ -1517,6 +1589,7 @@ def create_dicom_from_fda(
     *,
     meta: DicomMetadata | None = None,
     overrides: t.Mapping[str, t.Any] | None = None,
+    patient: PatientMeta | None = None,
 ) -> list:
     """Read a Topcon FDA file into a ``DicomStudy`` and write it.
 
@@ -1531,12 +1604,16 @@ def create_dicom_from_fda(
                 metadata parsed from this file. It is copied and not modified.
             overrides: DICOM keywords applied at write time. See
                 ``create_dicom_from_oct``.
+            patient: Optional patient module used only where the FDA patient
+                chunk left an attribute empty.
 
     Returns:
             list: List of path(s) to DICOM file(s)
     """
     study = read_fda_study(input_file)
-    return write_dicom_study(study, output_dir, meta=meta, overrides=overrides)
+    return write_dicom_study(
+        study, output_dir, meta=meta, overrides=overrides, patient=patient
+    )
 
 
 def create_dicom_from_fds(
