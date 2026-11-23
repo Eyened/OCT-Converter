@@ -1,115 +1,78 @@
-<h1 align="center">OCT Converter</h1>
-<p align="center">
- Python-based tools for reading OCT and fundus data.
-</p>
+# OCT-Converter (Eyened fork)
 
+Eye scanners store an OCT scan in the manufacturer’s own file format. This package reads those files and writes DICOM, the format hospital image systems use. It accepts Topcon (`.fda`, `.fds`), Heidelberg (`.e2e`), Zeiss (`.img`), and Bioptigen (`.oct`) scans.
 
-<p align="center">
-    <img width="320" height="320" src="https://user-images.githubusercontent.com/7947315/202814956-6e7e6702-82f4-4250-8625-ec23c1727e4f.jpg">
-    <img width="320" height="320" src="https://user-images.githubusercontent.com/7947315/202814575-9f18b7ca-3028-4d23-9b82-015995c44eab.gif">
-</p>
+Previewing a volume, saving a movie, or dumping the raw metadata is unchanged from the original project. That documentation is in the [upstream README](https://github.com/marksgraham/OCT-Converter#readme). This copy, maintained by Eyened from [marksgraham/OCT-Converter](https://github.com/marksgraham/OCT-Converter), is aimed at producing DICOM that a hospital viewer can file and open.
 
-## Description
-In ophthalmology, data acquired from the scanner is often exported in the manufacturer's proprietary file format. OCT-Converter provides python-based tools for extracting images (optical coherence tomography and fundus), as well as associated metadata, from these files.
+## What is different here
 
-## Supported file formats
-* .fds (Topcon)
-* .fda (Topcon)
-* .e2e (Heidelberg)
-* .img (Zeiss)
-* .oct (Bioptigen)
-* .OCT (Optovue)
-* .dcm
+### Convert a scan from the command line
 
-## Installation
-Requires python 3.7 or higher.
+Give the program a scan file, or a folder of them. It writes the DICOM files for you. You do not need to write a Python script for the common case.
 
 ```bash
-pip install oct-converter
+oct-converter scan.fda -o out/
 ```
 
+### One examination stays one set of files
 
-## Usage
-A number of example usage scripts are included in `examples/`.
+A single scan (e.g. an `.fda` file) can hold several images: the OCT, the fundus photo taken with it, a map of the retinal layers, and, for OCTA, a flow volume. Each of those becomes its own DICOM file, and they stay tied to the same examination. From `scan.fda` that is `scan.dcm`, `scan_fundus.dcm`, `scan_seg.dcm`, and, when the scan has flow data, `scan_octa.dcm`.
 
-Here is an example of reading a .fds file:
+### Standardized names
+
+The files use the standard names for the scan shape (a line, a cube, a circle, and so on), for retinal layer boundaries, and for which eye was imaged. Distances in the file follow the way that scan was taken. The scanner model is recorded. Its light wavelength is written only when that number is the one the DICOM standard asks for.
+
+### Smaller files, same pixels
+
+The pictures are stored with lossless JPEG 2000 compression, so the file is smaller and the pixels are unchanged. A picture that was already stored that way inside the scanner file is copied through as-is.
+
+### Replace the patient name or id
+
+From Python you can write a different patient name or id into the DICOM. The command line has no option for this; it writes the name from the file. The name is family name, a `^`, then given name.
 
 ```python
 from oct_converter.dicom import create_dicom_from_oct
-from oct_converter.readers import FDS
 
-# An example .fds file can be downloaded from the Biobank website:
-# https://biobank.ndph.ox.ac.uk/showcase/refer.cgi?id=30
-filepath = '/home/mark/Downloads/eg_oct_fds.fds'
-fds = FDS(filepath)
-
-oct_volume = fds.read_oct_volume()  # returns an OCT volume with additional metadata if available
-oct_volume.peek(show_contours=True) # plots a montage of the volume, with layer segmentations is available
-oct_volume.save('fds_testing.avi')  # save volume as a movie
-oct_volume.save('fds_testing.png')  # save volume as a set of sequential images, fds_testing_[1...N].png
-oct_volume.save_projection('projection.png') # save 2D projection
-
-fundus_image = fds.read_fundus_image()  # returns a  Fundus image with additional metadata if available
-fundus_image.save('fds_testing_fundus.jpg')
-
-metadata = fds.read_all_metadata(verbose=True) # extracts all other metadata
-with open("fds_metadata.json", "w") as outfile:
-    outfile.write(json.dumps(metadata, indent=4))
-
-# create and save a DICOM
-dcm = create_dicom_from_oct(filepath)
+create_dicom_from_oct(
+    "scan.fda",
+    output_dir="out",
+    overrides={"PatientName": "Doe^Jane", "PatientID": "P001"},
+)
 ```
 
-## Contributions
-Are welcome! Here is a [development roadmap](https://github.com/marksgraham/OCT-Converter/issues/86), including some easy first issues. Please open a [new issue](https://github.com/marksgraham/OCT-Converter/issues/new) to discuss any potential contributions.
+## Usage
 
-## Updates
-9 November 2023
-- Can now save .e2e, .img, .oct, and .OCT files as DICOMs with correct headers.
+Python 3.7 or newer, as declared by the package.
 
-22 September 2023
-- DICOM support: can now save .fda/.fds files as DICOMs with correct headers.
-- Much more complete extraction of .fda/.fds metadata.
+```bash
+pip install "oct_converter @ git+https://github.com/Eyened/OCT-Converter.git"
+```
 
-28 March 2023
-- Metadata extraction for .fds expanded to match that of .fda file.
+Convert one file, or every supported file in a directory:
 
-31 January 2023
-- Greatly extended support for extracting metadata from .fda files.
+```bash
+oct-converter scan.fda -o out/
+oct-converter /path/to/scans -o out/ -r
+```
 
-7 August 2022
-- Contours (layer segmentations) are now extracted from .e2e files.
-- Acquisition date is now extracted from .e2e files.
+A single file is written into `-o`. Several files each get a subdirectory named after the file stem, so companion names such as `*_octa.dcm` do not collide. The command prints each path it writes.
 
-16 June 2022
-- Initial support for reading Optovue OCTs.
-- Laterality is now extracted separately for each OCT/fundus image for .e2e files.
-- More patient info extracted from .e2e files (name, sex, birthdate, patient ID).
+The same entry point from Python:
 
-24 Aug 2021
-- Reading the Bioptigen .OCT format is now supported.
+```python
+from oct_converter.dicom import create_dicom_from_oct
 
-11 June 2021
-- Can now specify whether Zeiss .img data needs to be de-interlaced during reading.
+paths = create_dicom_from_oct("scan.fda", output_dir="out")
+```
 
-14 May 2021
-- Can save 2D projections of OCT volumes.
+`paths` lists every DICOM file written for that scan. For an FDA scan that is the OCT volume (`scan.dcm`) and, when the file contained them, `scan_fundus.dcm`, `scan_seg.dcm`, and `scan_octa.dcm`.
 
-30 October 2020
-- Extract fundus and laterality data from .e2e
-- Now attempts to extract additional volumetric data from .e2e files that was previously missed.
-
-22 August 2020
-- Experimental support for reading OCT data from .fda files.
-
-14 July 2020
-- Can now read fundus data from .fda files.
-
-## Related projects
-- [uocte](https://bitbucket.org/uocte/uocte/wiki/Home) inspired and enabled this project
-- [LibE2E](https://github.com/neurodial/LibE2E) and [LibOctData](https://github.com/neurodial/LibOctData) provided some additional descriptions of the .e2e file spec
-- [eyepy](https://github.com/MedVisBonn/eyepy) for python-based import, visualisation, and analysis of OCT data
-- [eyelab](https://github.com/MedVisBonn/eyelab) is a tool for annotating this data
+To replace the name stored in the scanner file, pass `overrides` as in the section above. The same call accepts `PatientSex`, `PatientBirthDate`, `Laterality`, `StudyInstanceUID`, and `SeriesInstanceUID`.
 
 ## Clinical use
-We can't guarantee images extracted with OCT-Converter will match those extracted or viewed with the manufacturer's software. Any use in clinical settings is at the user's own risk.
+
+Images and DICOM written with this package are not guaranteed to match the manufacturer’s software. Clinical use is at the user’s own risk.
+
+## License
+
+MIT. Copyright (c) 2021 Mark Graham. See [LICENSE](LICENSE).
