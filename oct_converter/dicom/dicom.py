@@ -7,11 +7,14 @@ from importlib import metadata
 from pathlib import Path
 
 import numpy as np
-from construct import StreamError, StringError
 from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
+from pydicom.encaps import encapsulate
 from pydicom.uid import (
     UID,
     ExplicitVRLittleEndian,
+    JPEG2000,
+    JPEG2000Lossless,
+    OphthalmicOpticalCoherenceTomographyBscanVolumeAnalysisStorage,
     OphthalmicPhotography8BitImageStorage,
     OphthalmicPhotography16BitImageStorage,
     OphthalmicTomographyImageStorage,
@@ -19,19 +22,32 @@ from pydicom.uid import (
 )
 from pydicom.valuerep import DSfloat
 
-from oct_converter.dicom.boct_meta import boct_dicom_metadata
-from oct_converter.dicom.e2e_meta import e2e_dicom_metadata
-from oct_converter.dicom.fda_meta import fda_dicom_metadata
-from oct_converter.dicom.fds_meta import fds_dicom_metadata
+from oct_converter.dicom.export import SeriesUidPlan, prepare_export
+from oct_converter.dicom.j2k import (
+    J2KFrames,
+    encode_j2k_lossless_frames,
+    prepare_j2k_frames,
+)
 from oct_converter.dicom.heightmap import (
     HEIGHTMAP_PADDING_VALUE,
     contours_to_heightmaps,
 )
-from oct_converter.dicom.img_meta import img_dicom_metadata
-from oct_converter.dicom.metadata import DicomMetadata
-from oct_converter.dicom.poct_meta import poct_dicom_metadata
-from oct_converter.exceptions import InvalidOCTReaderError
-from oct_converter.readers import BOCT, E2E, FDA, FDS, IMG, POCT
+from oct_converter.dicom.metadata import (
+    DicomMetadata,
+    OCTDetectorType,
+    OPTAcquisitionDevice,
+    PatientMeta,
+)
+from oct_converter.dicom.parse import (
+    read_boct_study,
+    read_e2e_study,
+    read_fda_study,
+    read_fds_study,
+    read_img_study,
+    read_poct_study,
+    read_study,
+)
+from oct_converter.dicom.write import write_dicom_study
 from oct_converter.readers.scan_geometry import (
     ScanGeometry,
     circle_reference_coordinates,
@@ -61,8 +77,14 @@ def _coerce_datetime(value: datetime | str | None) -> datetime | None:
 
 
 def set_content_date_time(ds: Dataset, when: datetime | None = None) -> None:
-    """Set ContentDate / ContentTime (when this DICOM instance was created)."""
-    when = when or datetime.now()
+    """Set ContentDate / ContentTime from when the pixels were acquired.
+
+    An empty timestamp stays empty. Conversion time is not a substitute.
+    """
+    if when is None:
+        ds.ContentDate = ""
+        ds.ContentTime = ""
+        return
     ds.ContentDate = when.strftime("%Y%m%d")
     ds.ContentTime = when.strftime("%H%M%S.%f")
 
@@ -105,6 +127,42 @@ def opt_base_dicom(filepath: Path) -> Dataset:
     return ds
 
 
+def _blank(value: t.Any) -> bool:
+    if value is None:
+        return True
+    return str(value).strip() == ""
+
+
+def fill_empty_patient(meta: DicomMetadata, patient: PatientMeta | None) -> None:
+    """Fill patient attributes the source left empty.
+
+    A non-empty value already on ``meta`` is kept. ``patient`` is not modified.
+    """
+    if patient is None:
+        return
+    dest = meta.patient_info
+    if _blank(dest.patient_id) and not _blank(patient.patient_id):
+        dest.patient_id = str(patient.patient_id).strip()
+    source_has_name = not _blank(dest.first_name) or not _blank(dest.last_name)
+    supplied_has_name = not _blank(patient.first_name) or not _blank(patient.last_name)
+    if not source_has_name and supplied_has_name:
+        dest.first_name = patient.first_name or ""
+        dest.last_name = patient.last_name or ""
+    if _blank(dest.patient_sex) and not _blank(patient.patient_sex):
+        dest.patient_sex = str(patient.patient_sex).strip()
+    if dest.patient_dob is None and patient.patient_dob is not None:
+        dest.patient_dob = patient.patient_dob
+
+
+def _positive_series_number(series_id: t.Any, default: int = 1) -> int:
+    """Series Number from a session id. Missing or non-positive becomes ``default``."""
+    try:
+        number = int(series_id)
+    except (TypeError, ValueError):
+        return default
+    return number if number > 0 else default
+
+
 def populate_patient_info(ds: Dataset, meta: DicomMetadata) -> Dataset:
     """Populates Patient Module PS3.3 C.7.1.1
 
@@ -114,10 +172,13 @@ def populate_patient_info(ds: Dataset, meta: DicomMetadata) -> Dataset:
     Returns:
             ds: Dataset, updated with patient information
     """
+    # Defined character set before any person name or other text.
+    ds.SpecificCharacterSet = "ISO_IR 192"
     # Patient Module PS3.3 C.7.1.1
-    ds.PatientName = (
-        f"{meta.patient_info.last_name or ''}^{meta.patient_info.first_name or ''}"
-    )
+    last = meta.patient_info.last_name or ""
+    first = meta.patient_info.first_name or ""
+    # A lone "^" is a delimiter with no name. Type 2 unknown is zero-length.
+    ds.PatientName = f"{last}^{first}" if last or first else ""
     ds.PatientID = meta.patient_info.patient_id or ""
     ds.PatientSex = meta.patient_info.patient_sex or ""
     ds.PatientBirthDate = (
@@ -149,8 +210,32 @@ def populate_manufacturer_info(ds: Dataset, meta: DicomMetadata) -> Dataset:
     ds.AcquisitionDeviceTypeCodeSequence[0].CodeValue = cv
     ds.AcquisitionDeviceTypeCodeSequence[0].CodingSchemeDesignator = cd
     ds.AcquisitionDeviceTypeCodeSequence[0].CodeMeaning = cm
-    ds.DetectorType = meta.oct_image_params.DetectorType.value
+    # Only a detector reported by the source file. UNKNOWN is not a DICOM
+    # enumerated value and is not a measurement.
+    if meta.oct_image_params.DetectorType is not OCTDetectorType.Unknown:
+        ds.DetectorType = meta.oct_image_params.DetectorType.value
+    if meta.oct_image_params.device_specs:
+        _apply_device_specs(ds, meta)
     return ds
+
+
+def _apply_device_specs(ds: Dataset, meta: DicomMetadata) -> None:
+    """Write optical tags that were taken from the device specification."""
+    params = meta.oct_image_params
+    for field, keyword in (
+        ("IlluminationWaveLength", "IlluminationWaveLength"),
+        ("IlluminationPower", "IlluminationPower"),
+        ("IlluminationBandwidth", "IlluminationBandwidth"),
+        ("DepthSpatialResolution", "DepthSpatialResolution"),
+        ("MaximumDepthDistortion", "MaximumDepthDistortion"),
+        ("AlongscanSpatialResolution", "AlongScanSpatialResolution"),
+        ("MaximumAlongscanDistortion", "MaximumAlongScanDistortion"),
+        ("AcrossscanSpatialResolution", "AcrossScanSpatialResolution"),
+        ("MaximumAcrossscanDistortion", "MaximumAcrossScanDistortion"),
+    ):
+        value = getattr(params, field)
+        if value is not None:
+            setattr(ds, keyword, value)
 
 
 def populate_opt_series(
@@ -178,15 +263,18 @@ def populate_opt_series(
     ds.StudyID = meta.series_info.study_id
     ds.StudyDate = format_dicom_date(meta.series_info.acquisition_date)
     ds.StudyTime = format_dicom_time(meta.series_info.acquisition_date)
+    # General Study Type 2. Present and empty when the source has no value.
+    if "ReferringPhysicianName" not in ds:
+        ds.ReferringPhysicianName = ""
+    if "AccessionNumber" not in ds:
+        ds.AccessionNumber = ""
     ds.Laterality = meta.series_info.laterality
-    ds.ProtocolName = meta.series_info.protocol
+    if meta.series_info.protocol:
+        ds.ProtocolName = meta.series_info.protocol
     ds.SeriesDescription = meta.series_info.description
     # Ophthalmic Tomography Series PS3.3 C.8.17.6
     ds.Modality = "OPT"
-    try:
-        ds.SeriesNumber = int(meta.series_info.series_id)
-    except (TypeError, ValueError):
-        ds.SeriesNumber = 1
+    ds.SeriesNumber = _positive_series_number(meta.series_info.series_id)
 
     # SOP Common module PS3.3 C.12.1
     ds.SOPClassUID = OphthalmicTomographyImageStorage
@@ -225,12 +313,7 @@ def opt_shared_functional_groups(ds: Dataset, meta: DicomMetadata) -> Dataset:
     ]
     # Pixel Measures PS3.3 C.7.6.16.2.1
     shared_ds[0].PixelMeasuresSequence = [Dataset()]
-    shared_ds[0].PixelMeasuresSequence[
-        0
-    ].PixelSpacing = meta.image_geometry.pixel_spacing
-    shared_ds[0].PixelMeasuresSequence[
-        0
-    ].SliceThickness = meta.image_geometry.slice_thickness
+    _apply_pixel_measures(shared_ds[0].PixelMeasuresSequence[0], meta)
     # Plane Orientation PS3.3 C.7.6.16.2.4
     shared_ds[0].PlaneOrientationSequence = [Dataset()]
     shared_ds[0].PlaneOrientationSequence[
@@ -238,6 +321,64 @@ def opt_shared_functional_groups(ds: Dataset, meta: DicomMetadata) -> Dataset:
     ].ImageOrientationPatient = meta.image_geometry.image_orientation
     ds.SharedFunctionalGroupsSequence = shared_ds
     return ds
+
+
+def _apply_pixel_measures(measures: Dataset, meta: DicomMetadata) -> None:
+    """Pixel Spacing, and either slice thickness or the cross-scan gap.
+
+    A positive slice thickness is a rectangular stack. A positive
+    ``spacing_between_slices`` is the gap between parallel lines and is
+    written as Spacing Between Slices. Zero is not written for either.
+    """
+    measures.PixelSpacing = meta.image_geometry.pixel_spacing
+    thickness = float(meta.image_geometry.slice_thickness or 0)
+    gap = float(meta.image_geometry.spacing_between_slices or 0)
+    if thickness > 0:
+        measures.SliceThickness = meta.image_geometry.slice_thickness
+    elif gap > 0:
+        measures.SpacingBetweenSlices = gap
+
+
+def _resolved_scan_pattern(
+    meta: DicomMetadata, n_frames: int
+) -> tuple[str, str, str] | None:
+    """CID 4272 for this dataset, or ``None`` when the code must be omitted."""
+    if meta.series_info.scan_pattern:
+        return meta.series_info.scan_pattern
+    if meta.series_info.scan_pattern_specified:
+        return None
+    geom = meta.scan_geometry
+    return scan_pattern_code(
+        (
+            ScanGeometry(
+                scan_type=geom.scan_type if geom else "volume",
+                start_angle=geom.start_angle if geom else None,
+                centre=tuple(geom.centre) if geom and geom.centre else None,
+                radius=geom.radius if geom else None,
+            )
+            if geom
+            else None
+        ),
+        n_frames,
+    )
+
+
+def _volumetric_properties_flag(meta: DicomMetadata, n_frames: int) -> str:
+    """YES only for a rectangular cube with a real stack interval."""
+    pattern = _resolved_scan_pattern(meta, n_frames)
+    thickness = float(meta.image_geometry.slice_thickness or 0)
+    if pattern and pattern[1] == "128279" and thickness > 0:
+        return "YES"
+    return "NO"
+
+
+def _assign_scan_pattern(ds: Dataset, meta: DicomMetadata, n_frames: int) -> None:
+    """Write CID 4272 when a pattern is known. Do not guess a cube."""
+    pattern = _resolved_scan_pattern(meta, n_frames)
+    if pattern is None:
+        return
+    scheme, value, meaning = pattern
+    ds.ScanPatternTypeCodeSequence = [_code_dataset(scheme, value, meaning)]
 
 
 def _encode_pixel_array(arr: np.ndarray) -> tuple[np.ndarray, int]:
@@ -339,19 +480,81 @@ def _apply_pixel_encoding_tags(
     samples_per_pixel: int = 1,
     photometric: str = "MONOCHROME2",
     pixel_representation: int = 0,
+    bits_stored: int | None = None,
+    planar: bool | None = None,
 ) -> None:
     """Set bit-depth, photometric, and full-range VOI window tags."""
+    stored = bits if bits_stored is None else bits_stored
     ds.SamplesPerPixel = samples_per_pixel
     ds.PhotometricInterpretation = photometric
     ds.PixelRepresentation = pixel_representation
     ds.BitsAllocated = bits
-    ds.BitsStored = bits
-    ds.HighBit = bits - 1
-    if photometric == "RGB":
+    ds.BitsStored = stored
+    ds.HighBit = stored - 1
+    if planar is None:
+        planar = photometric == "RGB"
+    if planar:
         ds.PlanarConfiguration = 0
-    elif photometric == "MONOCHROME2" or photometric == "MONOCHROME1":
-        ds.WindowCenter = 0 if pixel_representation == 1 else 1 << (bits - 1)
-        ds.WindowWidth = 1 << bits
+    elif "PlanarConfiguration" in ds:
+        del ds.PlanarConfiguration
+    # PS3.3 C.11.2.1.2.2: windowing applies only to MONOCHROME1 and MONOCHROME2.
+    if photometric in ("MONOCHROME1", "MONOCHROME2"):
+        window_bits = stored
+        ds.WindowCenter = 0 if pixel_representation == 1 else 1 << (window_bits - 1)
+        ds.WindowWidth = 1 << window_bits
+
+
+def _apply_j2k_pixels(ds: Dataset, frames: J2KFrames) -> None:
+    """Encapsulate JPEG 2000 codestreams and set the matching transfer syntax.
+
+    The codestreams are the bytes taken from the source file. Nothing is
+    decoded or encoded again. A reversible 5-3 wavelet uses the JPEG 2000
+    lossless transfer syntax; an irreversible 9-7 wavelet uses the lossy one.
+    """
+    syntax = JPEG2000Lossless if frames.reversible else JPEG2000
+    ds.file_meta.TransferSyntaxUID = syntax
+    ds.is_little_endian = True
+    ds.is_implicit_VR = False
+    _apply_pixel_encoding_tags(
+        ds,
+        frames.bits_allocated,
+        samples_per_pixel=frames.samples,
+        photometric=frames.photometric,
+        pixel_representation=frames.pixel_representation,
+        bits_stored=frames.bits_stored,
+        # Compressed samples are not planar. Colour images still carry
+        # Planar Configuration 0 so decoders that require the tag accept them.
+        planar=frames.samples > 1,
+    )
+    ds.LossyImageCompression = "00" if frames.reversible else "01"
+    if not frames.reversible:
+        stored = sum(len(codestream) for codestream in frames.codestreams)
+        uncompressed = (
+            frames.rows
+            * frames.columns
+            * frames.samples
+            * (frames.bits_allocated // 8)
+            * len(frames.codestreams)
+        )
+        if stored:
+            ds.LossyImageCompressionRatio = DSfloat(
+                uncompressed / stored, auto_format=True
+            )
+        ds.LossyImageCompressionMethod = "ISO_15444_1"
+    ds.PixelData = encapsulate(list(frames.codestreams))
+    pixel_data = ds["PixelData"]
+    pixel_data.VR = "OB"
+    pixel_data.is_undefined_length = True
+
+
+def _photography_timing(ds: Dataset, meta: DicomMetadata) -> None:
+    """Photography uses image laterality. Content time is when the pixels were acquired."""
+    if "Laterality" in ds:
+        del ds.Laterality
+    acquired = format_dicom_date(meta.series_info.acquisition_date)
+    if acquired:
+        ds.ContentDate = acquired
+        ds.ContentTime = format_dicom_time(meta.series_info.acquisition_date)
 
 
 def _photography_sop_uid(bits: int) -> UID:
@@ -361,15 +564,287 @@ def _photography_sop_uid(bits: int) -> UID:
     return OphthalmicPhotography16BitImageStorage
 
 
+def _ophthalmic_image_descriptors(ds: Dataset, monochrome: bool) -> None:
+    """Type 1 descriptors that describe the pixels, not the eye."""
+    ds.BurnedInAnnotation = "NO"
+    if monochrome:
+        ds.PresentationLUTShape = "IDENTITY"
+
+
+def _add_empty(ds: Dataset, keyword: str) -> None:
+    """Insert an empty element using the dictionary VR."""
+    if keyword in ds:
+        return
+    from pydicom.datadict import dictionary_VR, tag_for_keyword
+
+    tag = tag_for_keyword(keyword)
+    ds.add_new(tag, dictionary_VR(tag), None)
+
+
+def _empty_opt_acquisition(ds: Dataset) -> None:
+    """Type 2 OPT acquisition attributes. Empty means the FDA did not record them."""
+    ds.PositionReferenceIndicator = ""
+    ds.AcquisitionContextSequence = []
+    # Not a concatenation. Required by the OPT image module.
+    ds.ConcatenationFrameOffsetNumber = 0
+    ds.InConcatenationNumber = 1
+    ds.InConcatenationTotalNumber = 1
+    for keyword in (
+        "AxialLengthOfTheEye",
+        "HorizontalFieldOfView",
+        "EmmetropicMagnification",
+        "IntraOcularPressure",
+        "PupilDilated",
+    ):
+        _add_empty(ds, keyword)
+    ds.RefractiveStateSequence = []
+    ds.LightPathFilterTypeStackCodeSequence = []
+
+
+def _empty_photo_acquisition(ds: Dataset) -> None:
+    """Type 2 photography acquisition attributes, present and empty."""
+    for keyword in (
+        "HorizontalFieldOfView",
+        "EmmetropicMagnification",
+        "IntraOcularPressure",
+        "PupilDilated",
+    ):
+        _add_empty(ds, keyword)
+    ds.RefractiveStateSequence = []
+
+
+def _opt_multiframe_dimensions(ds: Dataset) -> None:
+    """Multi-frame Dimension module: one stack, ordered by B-scan."""
+    dim_uid = generate_uid()
+    dim_org = Dataset()
+    dim_org.DimensionOrganizationUID = dim_uid
+    ds.DimensionOrganizationSequence = [dim_org]
+    ds.DimensionOrganizationType = "3D"
+
+    def _index(pointer: tuple[int, int]) -> Dataset:
+        item = Dataset()
+        item.DimensionOrganizationUID = dim_uid
+        item.DimensionIndexPointer = pointer
+        item.FunctionalGroupPointer = (0x0020, 0x9111)  # Frame Content Sequence
+        return item
+
+    ds.DimensionIndexSequence = [
+        _index((0x0020, 0x9056)),  # Stack ID
+        _index((0x0020, 0x9057)),  # In-Stack Position Number
+    ]
+
+
+def write_oct_bscan_volume_analysis_dicom(
+    meta: DicomMetadata,
+    frames: t.Sequence[np.ndarray],
+    opt_ds: Dataset,
+    filepath: Path,
+    *,
+    bscans_per_frame: int = 1,
+    series_instance_uid: str | None = None,
+    sop_instance_uid: str | None = None,
+) -> FileDataset:
+    """Write Ophthalmic OCT B-scan Volume Analysis (flow / OCTA) DICOM.
+
+    Companion to an Ophthalmic Tomography Image. Shares Study and Frame of
+    Reference UIDs with ``opt_ds``. Modality is ``OPTBSV`` (PS3.3 C.8.17.18).
+    Pixel Representation is signed (IOD requirement); input frames are cast
+    to ``int16``.
+
+    Args:
+        meta: Shared DICOM metadata (patient, geometry, manufacturer).
+        frames: Flow B-scans, one ``(rows, cols)`` array per OPT frame.
+        opt_ds: Structural OPT instance this volume was derived from.
+        filepath: Output ``.dcm`` path.
+        bscans_per_frame: Repeats at each location (``0022,1642``).
+        series_instance_uid: Optional Series Instance UID override.
+        sop_instance_uid: Optional SOP Instance UID override.
+    """
+    if not frames:
+        raise ValueError("Angiography volume has no frames")
+    n_opt = int(getattr(opt_ds, "NumberOfFrames", 1) or 1)
+    if len(frames) != n_opt:
+        raise ValueError(
+            f"Angiography has {len(frames)} frames but OPT has {n_opt}"
+        )
+
+    filepath = Path(filepath)
+    file_meta = FileMetaDataset()
+    file_meta.MediaStorageSOPClassUID = (
+        OphthalmicOpticalCoherenceTomographyBscanVolumeAnalysisStorage
+    )
+    file_meta.MediaStorageSOPInstanceUID = sop_instance_uid or generate_uid()
+    file_meta.ImplementationClassUID = implementation_uid
+    file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    ds = FileDataset(str(filepath), {}, file_meta=file_meta, preamble=b"\0" * 128)
+
+    ds = populate_patient_info(ds, meta)
+    # AcquisitionDeviceTypeCodeSequence is OPT-only; strip after equipment tags.
+    ds = populate_manufacturer_info(ds, meta)
+    if "AcquisitionDeviceTypeCodeSequence" in ds:
+        del ds.AcquisitionDeviceTypeCodeSequence
+
+    # Study / Series — OPTBSV is a separate series from the structural OPT.
+    ds.StudyInstanceUID = opt_ds.StudyInstanceUID
+    ds.SeriesInstanceUID = series_instance_uid or generate_uid()
+    ds.StudyID = meta.series_info.study_id
+    ds.StudyDate = format_dicom_date(meta.series_info.acquisition_date)
+    ds.StudyTime = format_dicom_time(meta.series_info.acquisition_date)
+    ds.ReferringPhysicianName = getattr(opt_ds, "ReferringPhysicianName", "") or ""
+    ds.AccessionNumber = getattr(opt_ds, "AccessionNumber", "") or ""
+    ds.Laterality = meta.series_info.laterality
+    ds.SeriesDescription = meta.series_info.description or "OCTA flow"
+    ds.Modality = "OPTBSV"
+    try:
+        number = int(meta.series_info.series_id)
+    except (TypeError, ValueError):
+        number = 0
+    if number > 0:
+        ds.SeriesNumber = number + 1
+    else:
+        ds.SeriesNumber = int(getattr(opt_ds, "SeriesNumber", 1) or 1) + 1
+
+    ds.SOPClassUID = OphthalmicOpticalCoherenceTomographyBscanVolumeAnalysisStorage
+    ds.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+    ds.FrameOfReferenceUID = opt_ds.FrameOfReferenceUID
+
+    ds = populate_ocular_region(ds, meta)
+
+    # Image module — signed pixels, monochrome flow volume.
+    ds.ImageType = ["ORIGINAL", "PRIMARY"]
+    set_content_date_time(ds, _coerce_datetime(meta.series_info.acquisition_date))
+    ds.InstanceNumber = 1
+    ds.BurnedInAnnotation = "NO"
+    ds.RecognizableVisualFeatures = "NO"
+    ds.PresentationLUTShape = "IDENTITY"
+    ds.LossyImageCompression = "00"
+    ds.ConcatenationFrameOffsetNumber = 0
+    ds.InConcatenationNumber = 1
+    ds.InConcatenationTotalNumber = 1
+
+    signed = [np.ascontiguousarray(np.asarray(f), dtype=np.int16) for f in frames]
+    j2k = prepare_j2k_frames(encode_j2k_lossless_frames(signed))
+    if j2k.samples != 1:
+        raise ValueError(
+            "OCTA flow JPEG 2000 frames must be single component, "
+            f"got {j2k.samples}."
+        )
+    # IOD requires signed samples; the reversible codestream must match.
+    if j2k.pixel_representation != 1:
+        raise ValueError(
+            "OCTA flow JPEG 2000 must be signed (Pixel Representation 1), "
+            f"got {j2k.pixel_representation}."
+        )
+    _apply_j2k_pixels(ds, j2k)
+    # Supplement 197 / PS3.3 A.84.3.1: VOI LUT Module must not be used on this
+    # SOP Class. Windowing lives in Frame VOI LUT With LUT instead.
+    for keyword in ("WindowCenter", "WindowWidth", "WindowCenterWidthExplanation"):
+        if keyword in ds:
+            del ds[keyword]
+    n_frames = len(j2k.codestreams)
+    ds.NumberOfFrames = n_frames
+    ds.Rows = j2k.rows
+    ds.Columns = j2k.columns
+
+    # Acquisition method — Topcon OCTARA ≈ one-sided ratio (CID 4270).
+    algo = Dataset()
+    algo.AlgorithmFamilyCodeSequence = [
+        _code_dataset("DCM", "128304", "OCT-A one-sided ratio (lesser)")
+    ]
+    algo.AlgorithmName = "OCTARA"
+    algo.AlgorithmVersion = str(meta.manufacturer_info.software_version or "unknown")
+    ds.AcquisitionMethodAlgorithmSequence = [algo]
+
+    slab = float(meta.image_geometry.slice_thickness or 0)
+    acq = Dataset()
+    pattern = _resolved_scan_pattern(meta, n_frames)
+    if pattern is not None:
+        scheme, value, meaning = pattern
+        acq.ScanPatternTypeCodeSequence = [_code_dataset(scheme, value, meaning)]
+    acq.NumberOfBscansPerFrame = max(int(bscans_per_frame), 1)
+    acq.BscanSlabThickness = DSfloat(slab, auto_format=True)
+    acq.DistanceBetweenBscanSlabs = DSfloat(slab, auto_format=True)
+    acq.BscanCycleTime = DSfloat(0, auto_format=True)
+    ds.OCTBscanAnalysisAcquisitionParametersSequence = [acq]
+
+    _opt_multiframe_dimensions(ds)
+
+    # Shared functional groups: anatomy, pixel measures, orientation, VOI LUT.
+    shared = Dataset()
+    shared.FrameAnatomySequence = [Dataset()]
+    shared.FrameAnatomySequence[0].FrameLaterality = meta.series_info.laterality
+    shared.FrameAnatomySequence[0].AnatomicRegionSequence = [
+        ds.AnatomicRegionSequence[0].copy()
+    ]
+    shared.PixelMeasuresSequence = [Dataset()]
+    _apply_pixel_measures(shared.PixelMeasuresSequence[0], meta)
+    shared.PlaneOrientationSequence = [Dataset()]
+    shared.PlaneOrientationSequence[0].ImageOrientationPatient = (
+        meta.image_geometry.image_orientation
+    )
+    voi = Dataset()
+    voi.WindowCenter = 0
+    voi.WindowWidth = 1 << 16
+    shared.FrameVOILUTSequence = [voi]
+    ds.SharedFunctionalGroupsSequence = [shared]
+
+    purpose_struct = _code_dataset(
+        "DCM", "128250", "Structural image for imaging processing"
+    )
+    derivation_code = _code_dataset("DCM", "128303", "OCT B-scan analysis")
+
+    per_frame = []
+    for i in range(n_frames):
+        frame_fgs = Dataset()
+        frame_fgs.PlanePositionSequence = [Dataset()]
+        frame_fgs.PlanePositionSequence[0].ImagePositionPatient = [
+            0,
+            0,
+            DSfloat(i * (meta.image_geometry.slice_thickness or 0), auto_format=True),
+        ]
+        frame_fgs.FrameContentSequence = [Dataset()]
+        frame_fgs.FrameContentSequence[0].InStackPositionNumber = i + 1
+        frame_fgs.FrameContentSequence[0].StackID = "1"
+        frame_fgs.FrameContentSequence[0].DimensionIndexValues = [1, i + 1]
+
+        source = Dataset()
+        source.ReferencedSOPClassUID = str(opt_ds.SOPClassUID)
+        source.ReferencedSOPInstanceUID = opt_ds.SOPInstanceUID
+        source.ReferencedFrameNumber = [i + 1]
+        source.PurposeOfReferenceCodeSequence = [purpose_struct]
+        source.SpatialLocationsPreserved = "YES"
+
+        deriv = Dataset()
+        deriv.DerivationCodeSequence = [derivation_code]
+        deriv.SourceImageSequence = [source]
+        frame_fgs.DerivationImageSequence = [deriv]
+
+        ref = Dataset()
+        ref.ReferencedSOPClassUID = str(opt_ds.SOPClassUID)
+        ref.ReferencedSOPInstanceUID = opt_ds.SOPInstanceUID
+        ref.ReferencedFrameNumber = [i + 1]
+        ref.PurposeOfReferenceCodeSequence = [purpose_struct]
+        frame_fgs.ReferencedImageSequence = [ref]
+
+        per_frame.append(frame_fgs)
+    ds.PerFrameFunctionalGroupsSequence = per_frame
+
+    ds.save_as(
+        filepath, implicit_vr=False, little_endian=True, enforce_file_format=True
+    )
+    return ds
+
+
 def write_opt_dicom(
     meta: DicomMetadata,
-    frames: t.List[np.ndarray],
+    frames: t.Sequence[np.ndarray] | None,
     filepath: Path,
     study_instance_uid: str | None = None,
     frame_of_reference_uid: str | None = None,
     series_instance_uid: str | None = None,
     sop_instance_uid: str | None = None,
     fundus_ds: Dataset | None = None,
+    compressed_frames: t.Sequence[bytes] | None = None,
 ) -> FileDataset:
     """Writes required DICOM metadata and oct pixel data to .dcm file.
 
@@ -383,6 +858,8 @@ def write_opt_dicom(
             sop_instance_uid: Optional SOP Instance UID
             fundus_ds: Optional companion fundus FileDataset for Ophthalmic
                 Frame Location (circular / linear scan overlay on localizer)
+            compressed_frames: JPEG 2000 frame payloads to encapsulate in
+                place of ``frames``. ``frames`` is ignored when this is set.
     Returns:
             FileDataset of the written OPT instance (path is ``filepath``)
     """
@@ -404,52 +881,61 @@ def write_opt_dicom(
     ds.FrameOfReferenceUID = frame_of_reference_uid or generate_uid()
 
     # OPT Image Module PS3.3 C.8.17.7
-    ds.ImageType = ["DERIVED", "SECONDARY"]
+    # Values 1 and 2 are the defined pair. The flow volume is a separate SOP
+    # (Supplement 197 B-scan Volume Analysis); do not mark the structural
+    # OPT with a non-coded ANGIO value.
+    ds.ImageType = ["ORIGINAL", "PRIMARY"]
     ds.AcquisitionDateTime = format_acquisition_datetime(
         meta.series_info.acquisition_date
     )
     ds.AcquisitionNumber = 1
+    _ophthalmic_image_descriptors(ds, monochrome=True)
+    _empty_opt_acquisition(ds)
+    _opt_multiframe_dimensions(ds)
 
-    pixel_data, bits = _encode_pixel_array(frames)
-    if pixel_data.ndim == 2:
-        pixel_data = pixel_data[np.newaxis, ...]
-    if pixel_data.ndim != 3:
+    j2k = prepare_j2k_frames(list(compressed_frames)) if compressed_frames else None
+    if j2k is None and frames is not None:
+        # Decoded pixels (e.g. Triton PNG B-scans): re-encode JPEG 2000 lossless.
+        pixel_data, bits = _encode_pixel_array(frames)
+        if pixel_data.ndim == 2:
+            pixel_data = pixel_data[np.newaxis, ...]
+        if pixel_data.ndim != 3:
+            raise ValueError(
+                f"Expected OCT frames as a 3-D volume, got shape {pixel_data.shape}"
+            )
+        slice_list = [pixel_data[i] for i in range(pixel_data.shape[0])]
+        j2k = prepare_j2k_frames(encode_j2k_lossless_frames(slice_list))
+    if j2k is not None:
+        if j2k.samples != 1:
+            raise ValueError(
+                "Ophthalmic tomography JPEG 2000 frames must be single component, "
+                f"got {j2k.samples}."
+            )
+        n_frames = len(j2k.codestreams)
+        rows = j2k.rows
+        columns = j2k.columns
+        _apply_j2k_pixels(ds, j2k)
+    else:
         raise ValueError(
-            f"Expected OCT frames as a 3-D volume, got shape {pixel_data.shape}"
+            "write_opt_dicom requires frames or compressed_frames"
         )
-    pixel_representation = 1 if np.issubdtype(pixel_data.dtype, np.signedinteger) else 0
-    _apply_pixel_encoding_tags(
-        ds,
-        bits,
-        pixel_representation=pixel_representation,
-    )
-    ds.NumberOfFrames = int(pixel_data.shape[0])
-    ds.Rows = int(pixel_data.shape[1])
-    ds.Columns = int(pixel_data.shape[2])
+    ds.NumberOfFrames = n_frames
+    ds.Rows = rows
+    ds.Columns = columns
+    # Type 1. YES for a rectangular cube with a positive slice thickness.
+    ds.OphthalmicVolumetricPropertiesFlag = _volumetric_properties_flag(meta, n_frames)
 
     # Multi-frame Functional Groups Module PS3.3 C.7.6.16
-    set_content_date_time(ds)
+    # Content time is the acquisition of the B-scans, not when we wrote the file.
+    set_content_date_time(ds, _coerce_datetime(meta.series_info.acquisition_date))
     ds.InstanceNumber = 1
 
     # Scan Pattern Type (CID 4272) — Ophthalmic Tomography Parameters
     geom = meta.scan_geometry
-    scheme, value, meaning = scan_pattern_code(
-        (
-            ScanGeometry(
-                scan_type=geom.scan_type if geom else "volume",
-                start_angle=geom.start_angle if geom else None,
-                centre=tuple(geom.centre) if geom and geom.centre else None,
-                radius=geom.radius if geom else None,
-            )
-            if geom
-            else None
-        ),
-        int(pixel_data.shape[0]),
-    )
-    ds.ScanPatternTypeCodeSequence = [_code_dataset(scheme, value, meaning)]
+    _assign_scan_pattern(ds, meta, n_frames)
 
     per_frame = []
-    for i in range(pixel_data.shape[0]):
+    for i in range(n_frames):
         # Per Frame Functional Groups
         frame_fgs = Dataset()
         frame_fgs.PlanePositionSequence = [Dataset()]
@@ -458,6 +944,8 @@ def write_opt_dicom(
         frame_fgs.FrameContentSequence = [Dataset()]
         frame_fgs.FrameContentSequence[0].InStackPositionNumber = i + 1
         frame_fgs.FrameContentSequence[0].StackID = "1"
+        # Dimension Index Sequence order: Stack ID, then In-Stack Position.
+        frame_fgs.FrameContentSequence[0].DimensionIndexValues = [1, i + 1]
 
         # Ophthalmic Frame Location Macro (circular / linear vs fundus)
         if fundus_ds is not None and geom is not None:
@@ -499,7 +987,6 @@ def write_opt_dicom(
 
         per_frame.append(frame_fgs)
     ds.PerFrameFunctionalGroupsSequence = per_frame
-    ds.PixelData = _pixel_data_bytes(pixel_data)
     ds.save_as(
         filepath, implicit_vr=False, little_endian=True, enforce_file_format=True
     )
@@ -521,6 +1008,7 @@ def write_heightmap_seg_dicom(
     opt_ds: Dataset,
     filepath: Path,
     axial_spacing_mm: float | None = None,
+    series_instance_uid: str | None = None,
 ) -> Path | None:
     """Write a Height Map Segmentation DICOM from OCT layer contours.
 
@@ -534,6 +1022,7 @@ def write_heightmap_seg_dicom(
             filepath: Output path for the SEG file
             axial_spacing_mm: Axial (B-scan row) spacing in mm for RWVM.
                 Defaults to OPT pixel spacing row component when available.
+            series_instance_uid: Optional Series Instance UID.
     Returns:
             Path to written SEG file, or None if no contours to encode.
     """
@@ -582,15 +1071,26 @@ def write_heightmap_seg_dicom(
     ds.DeviceSerialNumber = meta.manufacturer_info.device_serial
     ds.SoftwareVersions = meta.manufacturer_info.software_version
 
-    # Study / Series / SOP
+    # Study / Series / SOP. Study-level attributes match the OPT instance.
     ds.StudyInstanceUID = opt_ds.StudyInstanceUID
-    ds.SeriesInstanceUID = generate_uid()
+    for keyword in (
+        "StudyDate",
+        "StudyTime",
+        "StudyID",
+        "AccessionNumber",
+        "ReferringPhysicianName",
+    ):
+        if keyword in opt_ds:
+            setattr(ds, keyword, opt_ds[keyword].value)
+    if "ReferringPhysicianName" not in ds:
+        ds.ReferringPhysicianName = ""
+    if "AccessionNumber" not in ds:
+        ds.AccessionNumber = ""
+    ds.PositionReferenceIndicator = ""
+    ds.SeriesInstanceUID = series_instance_uid or generate_uid()
     ds.FrameOfReferenceUID = opt_ds.FrameOfReferenceUID
     ds.Modality = "SEG"
-    try:
-        ds.SeriesNumber = int(meta.series_info.series_id) + 1000
-    except (TypeError, ValueError):
-        ds.SeriesNumber = 1000
+    ds.SeriesNumber = _positive_series_number(meta.series_info.series_id, default=0) + 1000
     ds.Laterality = meta.series_info.laterality
     ds.SeriesDescription = (
         f"{meta.series_info.description} Height Map Segmentation"
@@ -619,7 +1119,7 @@ def write_heightmap_seg_dicom(
     # Keep padding range a single value outside [0, OPT.Rows]
     ds.FloatPixelPaddingRangeLimit = HEIGHTMAP_PADDING_VALUE
 
-    set_content_date_time(ds)
+    set_content_date_time(ds, _coerce_datetime(meta.series_info.acquisition_date))
     ds.AcquisitionDateTime = format_acquisition_datetime(
         meta.series_info.acquisition_date
     )
@@ -675,9 +1175,10 @@ def write_heightmap_seg_dicom(
     # Shared functional groups: Pixel Measures, Derivation Image, RWVM, Plane Orientation
     shared = Dataset()
 
-    pm = Dataset()
-    pm.PixelSpacing = [slice_thickness, opt_col_spacing]
-    shared.PixelMeasuresSequence = [pm]
+    if slice_thickness > 0 and opt_col_spacing > 0:
+        pm = Dataset()
+        pm.PixelSpacing = [slice_thickness, opt_col_spacing]
+        shared.PixelMeasuresSequence = [pm]
 
     if num_bscans > 1:
         po = Dataset()
@@ -767,11 +1268,12 @@ def write_heightmap_seg_dicom(
 
 def write_fundus_dicom(
     meta: DicomMetadata,
-    frames: t.List[np.ndarray],
+    frames: t.Sequence[np.ndarray] | None,
     filepath: Path,
     study_instance_uid: str | None = None,
     series_instance_uid: str | None = None,
     sop_instance_uid: str | None = None,
+    compressed_frames: t.Sequence[bytes] | None = None,
 ) -> FileDataset:
     """Writes required DICOM metadata and fundus pixel data to .dcm file.
 
@@ -782,6 +1284,8 @@ def write_fundus_dicom(
             study_instance_uid: Optional shared Study Instance UID
             series_instance_uid: Optional Series Instance UID
             sop_instance_uid: Optional SOP Instance UID
+            compressed_frames: JPEG 2000 payloads to encapsulate. ``frames``
+                is ignored when this is set. Single-component images only.
     Returns:
             FileDataset of the written fundus instance
     """
@@ -796,48 +1300,57 @@ def write_fundus_dicom(
         sop_instance_uid=sop_instance_uid,
     )
     ds.Modality = "OP"
-    pixel_data, bits = _encode_pixel_array(_as_grayscale_array(frames))
-    if pixel_data.ndim != 2:
-        raise ValueError(
-            f"Expected 2-D grayscale fundus image, got shape {pixel_data.shape}"
-        )
+    j2k = prepare_j2k_frames(list(compressed_frames)) if compressed_frames else None
+    if j2k is None and frames is not None:
+        gray = _as_grayscale_array(frames)
+        pixel_data, _bits = _encode_pixel_array(gray)
+        if pixel_data.ndim != 2:
+            raise ValueError(
+                f"Expected 2-D grayscale fundus image, got shape {pixel_data.shape}"
+            )
+        j2k = prepare_j2k_frames(encode_j2k_lossless_frames([pixel_data]))
+    if j2k is not None:
+        if j2k.samples != 1:
+            raise ValueError(
+                "Grayscale fundus JPEG 2000 must be single component, "
+                f"got {j2k.samples}."
+            )
+        bits = j2k.bits_allocated
+        rows = j2k.rows
+        columns = j2k.columns
+    else:
+        raise ValueError("write_fundus_dicom requires frames or compressed_frames")
     photo_sop = _photography_sop_uid(bits)
     ds.SOPClassUID = photo_sop
     ds.file_meta.MediaStorageSOPClassUID = photo_sop
     ds.file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
     ds = populate_ocular_region(ds, meta)
 
-    ds.PixelSpacing = meta.image_geometry.pixel_spacing
-    ds.ImageOrientationPatient = meta.image_geometry.image_orientation
+    _set_image_plane(ds, meta)
 
-    # OPT Image Module PS3.3 C.8.17.7
-    ds.ImageType = ["DERIVED", "SECONDARY"]
+    # Ophthalmic photography image. Pixels are the acquired localizer.
+    ds.ImageType = ["ORIGINAL", "PRIMARY"]
     enface_to_type = {
         "IR": "RED",
         "FA": "BLUE",
         "ICGA": "GREEN",
     }
-    if ds.ProtocolName in enface_to_type:
+    if getattr(ds, "ProtocolName", None) in enface_to_type:
         ds.ImageType.append(enface_to_type.get(ds.ProtocolName))
     ds.AcquisitionDateTime = format_acquisition_datetime(
         meta.series_info.acquisition_date
     )
-    ds.AcquisitionNumber = 1
-    pixel_representation = 1 if np.issubdtype(pixel_data.dtype, np.signedinteger) else 0
-    _apply_pixel_encoding_tags(
-        ds,
-        bits,
-        pixel_representation=pixel_representation,
-    )
+    _ophthalmic_image_descriptors(ds, monochrome=True)
+    _empty_photo_acquisition(ds)
+    _apply_j2k_pixels(ds, j2k)
     ds.NumberOfFrames = 1
 
     # Multi-frame Functional Groups Module PS3.3 C.7.6.16
-    set_content_date_time(ds)
+    _photography_timing(ds, meta)
     ds.InstanceNumber = 1
-    ds.Rows = int(pixel_data.shape[0])
-    ds.Columns = int(pixel_data.shape[1])
+    ds.Rows = rows
+    ds.Columns = columns
 
-    ds.PixelData = _pixel_data_bytes(pixel_data)
     ds.save_as(
         filepath, implicit_vr=False, little_endian=True, enforce_file_format=True
     )
@@ -846,9 +1359,11 @@ def write_fundus_dicom(
 
 def write_color_fundus_dicom(
     meta: DicomMetadata,
-    frames: t.List[np.ndarray],
+    frames: t.Sequence[np.ndarray] | None,
     filepath: Path,
     study_instance_uid: str | None = None,
+    series_instance_uid: str | None = None,
+    compressed_frames: t.Sequence[bytes] | None = None,
 ) -> Path:
     """Writes required DICOM metadata and RGB fundus pixel data to .dcm file.
 
@@ -857,21 +1372,47 @@ def write_color_fundus_dicom(
             frames: list of frames of pixel data
             filepath: Path to where output file is being saved
             study_instance_uid: Optional shared Study Instance UID
+            series_instance_uid: Optional Series Instance UID
+            compressed_frames: JPEG 2000 payloads to encapsulate. ``frames``
+                is ignored when this is set. Three-component images only.
     Returns:
-            Path to created DICOM file
+            FileDataset of the written fundus instance (path is ``filepath``)
     """
     ds = opt_base_dicom(filepath)
     ds = populate_patient_info(ds, meta)
     ds = populate_manufacturer_info(ds, meta)
-    ds = populate_opt_series(ds, meta, study_instance_uid=study_instance_uid)
+    ds = populate_opt_series(
+        ds,
+        meta,
+        study_instance_uid=study_instance_uid,
+        series_instance_uid=series_instance_uid,
+    )
     ds.Modality = "OP"
-    rgb = np.asarray(frames)
-    if rgb.ndim == 3 and rgb.shape[-1] == 4:
-        rgb = rgb[..., :3]
-    pixel_data, bits = _encode_pixel_array(rgb)
-    if pixel_data.ndim != 3 or pixel_data.shape[-1] != 3:
+    j2k = prepare_j2k_frames(list(compressed_frames)) if compressed_frames else None
+    if j2k is None and frames is not None:
+        # Topcon colour FDA is BGR-labeled JP2; callers pass corrected RGB
+        # pixels. Re-encode JPEG 2000 lossless (no MCT → photometric RGB).
+        rgb = np.asarray(frames)
+        if rgb.ndim == 3 and rgb.shape[-1] == 4:
+            rgb = rgb[..., :3]
+        pixel_data, _bits = _encode_pixel_array(rgb)
+        if pixel_data.ndim != 3 or pixel_data.shape[-1] != 3:
+            raise ValueError(
+                f"Expected HxWx3 RGB fundus image, got shape {pixel_data.shape}"
+            )
+        j2k = prepare_j2k_frames(encode_j2k_lossless_frames([pixel_data]))
+    if j2k is not None:
+        if j2k.samples != 3:
+            raise ValueError(
+                "Colour fundus JPEG 2000 must have 3 components, "
+                f"got {j2k.samples}."
+            )
+        bits = j2k.bits_allocated
+        rows = j2k.rows
+        columns = j2k.columns
+    else:
         raise ValueError(
-            f"Expected HxWx3 RGB fundus image, got shape {pixel_data.shape}"
+            "write_color_fundus_dicom requires frames or compressed_frames"
         )
     photo_sop = _photography_sop_uid(bits)
     ds.SOPClassUID = photo_sop
@@ -879,43 +1420,94 @@ def write_color_fundus_dicom(
     ds.file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
     ds = populate_ocular_region(ds, meta)
 
-    ds.PixelSpacing = meta.image_geometry.pixel_spacing
-    ds.ImageOrientationPatient = meta.image_geometry.image_orientation
+    _set_image_plane(ds, meta)
 
-    # OPT Image Module PS3.3 C.8.17.7
-    ds.ImageType = ["DERIVED", "SECONDARY"]
+    # Ophthalmic photography image. Pixels are the acquired fundus.
+    ds.ImageType = ["ORIGINAL", "PRIMARY"]
     enface_to_type = {
         "IR": "RED",
         "FA": "BLUE",
         "ICGA": "GREEN",
     }
-    if ds.ProtocolName in enface_to_type:
+    if getattr(ds, "ProtocolName", None) in enface_to_type:
         ds.ImageType.append(enface_to_type.get(ds.ProtocolName))
     ds.AcquisitionDateTime = format_acquisition_datetime(
         meta.series_info.acquisition_date
     )
-    ds.AcquisitionNumber = 1
-    pixel_representation = 1 if np.issubdtype(pixel_data.dtype, np.signedinteger) else 0
-    _apply_pixel_encoding_tags(
-        ds,
-        bits,
-        samples_per_pixel=3,
-        photometric="RGB",
-        pixel_representation=pixel_representation,
-    )
+    _ophthalmic_image_descriptors(ds, monochrome=False)
+    _empty_photo_acquisition(ds)
+    _apply_j2k_pixels(ds, j2k)
     ds.NumberOfFrames = 1
 
-    # Multi-frame Functional Groups Module PS3.3 C.7.6.16
-    set_content_date_time(ds)
+    _photography_timing(ds, meta)
     ds.InstanceNumber = 1
-    ds.Rows = int(pixel_data.shape[0])
-    ds.Columns = int(pixel_data.shape[1])
+    ds.Rows = rows
+    ds.Columns = columns
 
-    ds.PixelData = _pixel_data_bytes(pixel_data)
     ds.save_as(
         filepath, implicit_vr=False, little_endian=True, enforce_file_format=True
     )
-    return filepath
+    return ds
+
+
+def _set_image_plane(ds: Dataset, meta: DicomMetadata) -> None:
+    """Write pixel spacing and orientation only when the source measured them."""
+    spacing = meta.image_geometry.pixel_spacing
+    if spacing:
+        ds.PixelSpacing = spacing
+    orientation = meta.image_geometry.image_orientation
+    if orientation:
+        ds.ImageOrientationPatient = orientation
+
+
+def _without_opt_image_plane(meta: DicomMetadata, write):
+    """Fundus photos do not inherit the OCT volume's millimetre geometry."""
+    saved_spacing = list(meta.image_geometry.pixel_spacing or [])
+    saved_orientation = list(meta.image_geometry.image_orientation or [])
+    meta.image_geometry.pixel_spacing = []
+    meta.image_geometry.image_orientation = []
+    try:
+        return write()
+    finally:
+        meta.image_geometry.pixel_spacing = saved_spacing
+        meta.image_geometry.image_orientation = saved_orientation
+
+
+def _with_description(meta: DicomMetadata, fallback: str, write):
+    """Use the series description, the capture label, or a name for this object."""
+    saved = meta.series_info.description
+    label = (saved or meta.series_info.protocol or "").strip()
+    meta.series_info.description = label or fallback
+    try:
+        return write()
+    finally:
+        meta.series_info.description = saved
+
+
+def _with_acquisition_device(meta: DicomMetadata, device: OPTAcquisitionDevice, write):
+    saved = meta.oct_image_params.opt_acquisition_device
+    meta.oct_image_params.opt_acquisition_device = device
+    try:
+        return write()
+    finally:
+        meta.oct_image_params.opt_acquisition_device = saved
+
+
+def _begin_export(
+    built: DicomMetadata,
+    supplied: DicomMetadata | None,
+    overrides: t.Mapping[str, t.Any] | None,
+    study_instance_uid: str | None = None,
+) -> tuple[DicomMetadata, str, SeriesUidPlan]:
+    """Copy parsed metadata, apply overrides, and choose the shared study UID.
+
+    ``supplied`` replaces the metadata built from the file. Overrides are
+    applied to a copy of whichever object is used. One study UID is shared
+    by every DICOM written from a single input file.
+    """
+    prepared = prepare_export(supplied if supplied is not None else built, overrides)
+    study_uid = prepared.study_instance_uid or study_instance_uid or generate_uid()
+    return prepared.meta, study_uid, prepared.series
 
 
 def create_dicom_from_oct(
@@ -929,6 +1521,10 @@ def create_dicom_from_oct(
     scalex: float = 0.01,
     slice_thickness: float = 0.05,
     apply_registration: bool = False,
+    *,
+    meta: DicomMetadata | None = None,
+    overrides: t.Mapping[str, t.Any] | None = None,
+    patient: PatientMeta | None = None,
 ) -> list:
     """Creates a DICOM file with the data parsed from
     the input file.
@@ -948,6 +1544,17 @@ def create_dicom_from_oct(
             apply_registration: If .e2e file, apply Heidelberg B-scan
                 registration to OCT pixels and layer contours before writing
                 DICOM. Defaults to False.
+            meta: ``DicomMetadata`` to write instead of the metadata built
+                from this file. The object is copied and is not modified.
+            overrides: DICOM keywords applied to a copy of ``meta`` (or of
+                the metadata built from the file). ``StudyInstanceUID`` is
+                one UID for every file this call writes. ``SeriesInstanceUID``
+                is a UID for the structural OPT, or a dict of roles
+                ``opt``, ``fundus``, ``fundus_grayscale``, ``octa``, and
+                ``seg`` to a UID or a list of UIDs. See ``prepare_export``.
+            patient: Optional patient module used only to fill attributes
+                the file left empty. A non-empty value from the file wins.
+                ``StudyID`` is not taken from this object.
 
     Returns:
             list: list of Path(s) to DICOM file
@@ -958,72 +1565,33 @@ def create_dicom_from_oct(
     else:
         output_dir = Path.cwd()
 
-    file_suffix = input_file.split(".")[-1].lower()
-
-    if file_suffix == "fds":
-        files = create_dicom_from_fds(input_file, output_dir)
-    elif file_suffix == "fda":
-        files = create_dicom_from_fda(input_file, output_dir)
-    elif file_suffix == "img":
-        files = create_dicom_from_img(input_file, output_dir, rows, cols, interlaced)
-    elif file_suffix == "oct":
-        # Bioptigen and Octovue both use .OCT.
-        # BOCT._validate on init can check if Bioptigen, else Optivue
-        try:
-            BOCT(input_file)
-            files = create_dicom_from_boct(input_file, output_dir, diskbuffered)
-        except (InvalidOCTReaderError, StreamError, UnicodeDecodeError, StringError):
-            # if BOCT raises, treat as POCT
-            files = create_dicom_from_poct(input_file, output_dir)
-    elif file_suffix == "e2e":
-        files = create_dicom_from_e2e(
-            input_file,
-            output_dir,
-            extract_scan_repeats,
-            scalex,
-            slice_thickness,
-            apply_registration=apply_registration,
-        )
-    else:
-        raise TypeError(
-            f"DICOM conversion for {file_suffix} is not supported. "
-            "Currently supported filetypes are .e2e, .fds, .fda, .img, .OCT."
-        )
-
-    return files
+    study = read_study(
+        input_file,
+        rows=rows,
+        cols=cols,
+        interlaced=interlaced,
+        diskbuffered=diskbuffered,
+        extract_scan_repeats=extract_scan_repeats,
+        scalex=scalex,
+        slice_thickness=slice_thickness,
+        apply_registration=apply_registration,
+    )
+    return write_dicom_study(
+        study, output_dir, meta=meta, overrides=overrides, patient=patient
+    )
 
 
 def create_dicom_from_boct(
     input_file: str,
     output_dir: str = None,
     diskbuffered: bool = False,
+    *,
+    meta: DicomMetadata | None = None,
+    overrides: t.Mapping[str, t.Any] | None = None,
 ) -> list:
-    """Creates DICOM file(s) with the data parsed from
-    the input file.
-
-    Args:
-            input_file: Bioptigen OCT file
-            output_dir: Output directory
-            diskbuffered: If True, reduces memory usage by storing volume on disk using HDF5.
-
-    Returns:
-            list: List of path(s) to DICOM file(s)"""
-
-    boct = BOCT(input_file)
-    oct_volumes = boct.read_oct_volume(diskbuffered)
-    if len(oct_volumes) == 0:
-        raise ValueError("No OCT volumes found in OCT input file.")
-
-    files = []
-
-    for count, oct in enumerate(oct_volumes):
-        meta = boct_dicom_metadata(oct)
-        filename = f"{Path(input_file).stem}_{str(count)}.dcm"
-        filepath = Path(output_dir, filename)
-        file = write_opt_dicom(meta, oct.volume, filepath)
-        files.append(filepath)
-
-    return files
+    """Read a Bioptigen OCT file into a ``DicomStudy`` and write it."""
+    study = read_boct_study(input_file, diskbuffered=diskbuffered)
+    return write_dicom_study(study, output_dir, meta=meta, overrides=overrides)
 
 
 def create_dicom_from_e2e(
@@ -1033,209 +1601,64 @@ def create_dicom_from_e2e(
     scalex: float = 0.01,
     slice_thickness: float = 0.05,
     apply_registration: bool = False,
+    *,
+    meta: DicomMetadata | None = None,
+    overrides: t.Mapping[str, t.Any] | None = None,
 ) -> list:
-    """Creates DICOM file(s) with the data parsed from
-    the input file.
-
-    Args:
-            input_file: E2E file with OCT data
-            output_dir: Output directory
-            extract_scan_repeats: If True, will extract all scan repeats
-            scalex: Manually set scale of x axis
-            slice_thickness: Manually set scale of z axis
-            apply_registration: Apply Heidelberg B-scan registration to
-                OCT pixels and contours before writing. Defaults to False.
-
-    Returns:
-            list: List of path(s) to DICOM file(s)
-    """
-    e2e = E2E(input_file)
-    oct_volumes = e2e.read_oct_volume(
+    """Read a Heidelberg E2E file into a ``DicomStudy`` and write it."""
+    study = read_e2e_study(
+        input_file,
+        extract_scan_repeats=extract_scan_repeats,
         scalex=scalex,
         slice_thickness=slice_thickness,
         apply_registration=apply_registration,
     )
-    fundus_images = e2e.read_fundus_image(
-        extract_scan_repeats=extract_scan_repeats, scalex=scalex
-    )
-    if len(oct_volumes) == 0 and len(fundus_images) == 0:
-        raise ValueError("No OCT volumes or fundus images found in e2e input file.")
-
-    files = []
-    # Map series key -> fundus FileDataset for Ophthalmic Frame Location
-    fundus_by_id: dict[str, Dataset] = {}
-    # Shared Study UID per E2E file
-    study_uid = generate_uid()
-
-    if len(fundus_images) > 0:
-        for count, fundus in enumerate(fundus_images):
-            meta = e2e_dicom_metadata(fundus)
-            filename = f"{Path(input_file).stem}_fundus_{str(count)}.dcm"
-            filepath = Path(output_dir, filename)
-            fundus_ds = write_fundus_dicom(
-                meta, fundus.image, filepath, study_instance_uid=study_uid
-            )
-            files.append(filepath)
-            if fundus.image_id:
-                # Strip trailing underscores used for scan-repeat disambiguation
-                key = fundus.image_id.rstrip("_")
-                fundus_by_id.setdefault(key, fundus_ds)
-                fundus_by_id[fundus.image_id] = fundus_ds
-
-    if len(oct_volumes) > 0:
-        for count, oct in enumerate(oct_volumes):
-            meta = e2e_dicom_metadata(oct)
-            for_uid = generate_uid()
-            filename = f"{Path(input_file).stem}_oct_{str(count)}.dcm"
-            filepath = Path(output_dir, filename)
-            fundus_ds = None
-            if oct.volume_id:
-                fundus_ds = fundus_by_id.get(oct.volume_id) or fundus_by_id.get(
-                    oct.volume_id.rstrip("_")
-                )
-            # Fallback: single fundus for single OCT
-            if fundus_ds is None and len(fundus_by_id) == 1:
-                fundus_ds = next(iter(fundus_by_id.values()))
-            opt_ds = write_opt_dicom(
-                meta,
-                oct.volume,
-                filepath,
-                study_instance_uid=study_uid,
-                frame_of_reference_uid=for_uid,
-                fundus_ds=fundus_ds,
-            )
-            files.append(filepath)
-
-            if oct.contours:
-                # Axial spacing is scaley (E2E pixel_spacing[1]).
-                axial_mm = None
-                if oct.pixel_spacing and len(oct.pixel_spacing) >= 2:
-                    axial_mm = float(oct.pixel_spacing[1])
-                seg_filename = f"{Path(input_file).stem}_seg_{str(count)}.dcm"
-                seg_filepath = Path(output_dir, seg_filename)
-                seg_path = write_heightmap_seg_dicom(
-                    meta,
-                    oct.contours,
-                    opt_ds,
-                    seg_filepath,
-                    axial_spacing_mm=axial_mm,
-                )
-                if seg_path is not None:
-                    files.append(seg_path)
-
-    return files
+    return write_dicom_study(study, output_dir, meta=meta, overrides=overrides)
 
 
 def create_dicom_from_fda(
     input_file: str,
     output_dir: str,
+    *,
+    meta: DicomMetadata | None = None,
+    overrides: t.Mapping[str, t.Any] | None = None,
+    patient: PatientMeta | None = None,
 ) -> list:
-    """Creates DICOM file(s) with the data parsed from
-    the input file.
+    """Read a Topcon FDA file into a ``DicomStudy`` and write it.
 
-    When layer contours are present on the OCT volume, also writes a Height
-    Map Segmentation companion (``{stem}_seg.dcm``) sharing Study and Frame
-    of Reference UIDs with the OPT volume.
+    Contours become a height-map segmentation. An angiography chunk becomes
+    a B-scan Volume Analysis companion. JPEG 2000 localizers are encapsulated;
+    a colour fundus stored as B, G, R is written as RGB.
 
     Args:
             input_file: FDA file with OCT data
             output_dir: Output directory
+            meta: ``DicomMetadata`` used for every instance instead of the
+                metadata parsed from this file. It is copied and not modified.
+            overrides: DICOM keywords applied at write time. See
+                ``create_dicom_from_oct``.
+            patient: Optional patient module used only where the FDA patient
+                chunk left an attribute empty.
 
     Returns:
             list: List of path(s) to DICOM file(s)
     """
-    files = []
-    fda = FDA(input_file)
-    oct = fda.read_oct_volume()
-    meta = fda_dicom_metadata(oct)
-    study_uid = generate_uid()
-    for_uid = generate_uid()
-    output_filename = f"{Path(input_file).stem}.dcm"
-    filepath = Path(output_dir, output_filename)
-    opt_ds = write_opt_dicom(
-        meta,
-        oct.volume,
-        filepath,
-        study_instance_uid=study_uid,
-        frame_of_reference_uid=for_uid,
+    study = read_fda_study(input_file)
+    return write_dicom_study(
+        study, output_dir, meta=meta, overrides=overrides, patient=patient
     )
-    files.append(filepath)
-
-    # Write SEG before fundus mutates image_geometry.pixel_spacing.
-    if oct.contours:
-        axial_mm = None
-        if oct.pixel_spacing and len(oct.pixel_spacing) >= 3:
-            axial_mm = float(oct.pixel_spacing[2])
-        seg_filepath = Path(output_dir, f"{Path(input_file).stem}_seg.dcm")
-        seg_path = write_heightmap_seg_dicom(
-            meta,
-            oct.contours,
-            opt_ds,
-            seg_filepath,
-            axial_spacing_mm=axial_mm,
-        )
-        if seg_path is not None:
-            files.append(seg_path)
-
-    # Attempt to parse fundus images
-    fundus = fda.read_fundus_image()
-    if fundus:
-        output_filename = f"{Path(input_file).stem}_fundus.dcm"
-        filepath = Path(output_dir, output_filename)
-        meta.image_geometry.pixel_spacing = [1, 1]
-        file = write_color_fundus_dicom(
-            meta, fundus.image, filepath, study_instance_uid=study_uid
-        )
-        files.append(file)
-
-    fundus_grayscale = fda.read_fundus_image_gray_scale()
-    if fundus_grayscale:
-        output_filename = f"{Path(input_file).stem}_fundus_grayscale.dcm"
-        filepath = Path(output_dir, output_filename)
-        meta.image_geometry.pixel_spacing = [1, 1]
-        write_fundus_dicom(
-            meta,
-            fundus_grayscale.image,
-            filepath,
-            study_instance_uid=study_uid,
-        )
-        files.append(filepath)
-
-    return files
 
 
 def create_dicom_from_fds(
     input_file: str,
     output_dir: str,
+    *,
+    meta: DicomMetadata | None = None,
+    overrides: t.Mapping[str, t.Any] | None = None,
 ) -> list:
-    """Creates DICOM file(s) with the data parsed from
-    the input file.
-
-    Args:
-            input_file: FDS file with OCT data
-            output_dir: Output directory
-
-    Returns:
-            list: List of path(s) to DICOM file(s)
-    """
-    files = []
-    fds = FDS(input_file)
-    oct = fds.read_oct_volume()
-    meta = fds_dicom_metadata(oct)
-    output_filename = f"{Path(input_file).stem}.dcm"
-    filepath = Path(output_dir, output_filename)
-    file = write_opt_dicom(meta, oct.volume, filepath)
-    files.append(filepath)
-
-    # Attempt to parse fundus images
-    fundus = fds.read_fundus_image()
-    if fundus:
-        output_filename = f"{Path(input_file).stem}_fundus.dcm"
-        filepath = Path(output_dir, output_filename)
-        file = write_color_fundus_dicom(meta, fundus.image, filepath)
-        files.append(file)
-
-    return files
+    """Read a Topcon FDS file into a ``DicomStudy`` and write it."""
+    study = read_fds_study(input_file)
+    return write_dicom_study(study, output_dir, meta=meta, overrides=overrides)
 
 
 def create_dicom_from_img(
@@ -1244,51 +1667,22 @@ def create_dicom_from_img(
     rows: int = 1024,
     cols: int = 512,
     interlaced: bool = False,
-) -> Path:
-    """Creates a DICOM file with the data parsed from
-    the input file.
-
-    Args:
-            input_file: .img file with OCT data
-            output_dir: Output directory
-            rows: Optional, for manually setting rows. Default 1024.
-            cols: Optional, for manually setting cols. Default 512.
-            interlaced: Optional, for setting interlaced. Default False.
-
-    Returns:
-            list: List of path(s) to DICOM file(s)
-    """
-    img = IMG(input_file)
-    oct = img.read_oct_volume(rows, cols, interlaced)
-    meta = img_dicom_metadata(oct)
-    output_filename = f"{Path(input_file).stem}.dcm"
-    filepath = Path(output_dir, output_filename)
-    file = write_opt_dicom(meta, oct.volume, filepath)
-    return [filepath]
+    *,
+    meta: DicomMetadata | None = None,
+    overrides: t.Mapping[str, t.Any] | None = None,
+) -> list:
+    """Read a Zeiss IMG file into a ``DicomStudy`` and write it."""
+    study = read_img_study(input_file, rows=rows, cols=cols, interlaced=interlaced)
+    return write_dicom_study(study, output_dir, meta=meta, overrides=overrides)
 
 
 def create_dicom_from_poct(
     input_file: str,
     output_dir: str,
+    *,
+    meta: DicomMetadata | None = None,
+    overrides: t.Mapping[str, t.Any] | None = None,
 ) -> list:
-    """Creates DICOM file(s) with the data parsed from
-    the input file.
-
-    Args:
-            input_file: File with POCT data
-            output_dir: Output directory
-
-    Returns:
-            list: List of path(s) to DICOM file(s)
-    """
-    poct = POCT(input_file)
-    octs = poct.read_oct_volume()
-    files = []
-    for count, oct in enumerate(octs):
-        meta = poct_dicom_metadata(oct)
-        filename = f"{Path(input_file).stem}_{str(count)}.dcm"
-        filepath = Path(output_dir, filename)
-        file = write_opt_dicom(meta, oct.volume, filepath)
-        files.append(filepath)
-
-    return files
+    """Read an Optovue OCT file into a ``DicomStudy`` and write it."""
+    study = read_poct_study(input_file)
+    return write_dicom_study(study, output_dir, meta=meta, overrides=overrides)

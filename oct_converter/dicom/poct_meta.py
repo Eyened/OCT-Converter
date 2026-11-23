@@ -101,11 +101,10 @@ def poct_dicom_metadata(poct: OCTVolumeWithMetaData) -> DicomMetadata:
     Returns:
         DicomMetadata: Populated DicomMetadata created with OCT metadata
     """
-    meta = DicomMetadata
-    meta.patient_info = PatientMeta()
-    meta.series_info = poct_series_meta(poct)
-    meta.manufacturer_info = poct_manu_meta()
-    meta.image_geometry = poct_image_geom(poct.pixel_spacing)
-    meta.oct_image_params = poct_image_params()
-
-    return meta
+    return DicomMetadata(
+        patient_info=PatientMeta(),
+        series_info=poct_series_meta(poct),
+        manufacturer_info=poct_manu_meta(),
+        image_geometry=poct_image_geom(poct.pixel_spacing),
+        oct_image_params=poct_image_params(),
+    )

@@ -27,8 +27,12 @@ dependencies = [
     "matplotlib",
     "imageio-ffmpeg",
     "h5py",
+    "imagecodecs",
 ]
 requires-python = ">=3.7"
+
+[project.scripts]
+oct-converter = "oct_converter.cli:run"
 
 [project.urls]
 Homepage = "https://github.com/marksgraham/OCT-Converter"

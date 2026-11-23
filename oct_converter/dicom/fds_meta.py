@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from oct_converter.dicom.fda_meta import (
+    apply_topcon_device_specs,
+    topcon_image_geometry,
+    _model_name,
+)
 from oct_converter.dicom.metadata import (
     DicomMetadata,
     ImageGeometry,
     ManufacturerMeta,
-    OCTDetectorType,
     OCTImageParams,
     OPTAcquisitionDevice,
     OPTAnatomyStructure,
@@ -14,6 +18,7 @@ from oct_converter.dicom.metadata import (
     SeriesMeta,
 )
 from oct_converter.image_types import OCTVolumeWithMetaData
+from oct_converter.readers.scan_geometry import topcon_scan_pattern
 
 
 def fds_patient_meta(fds_metadata: dict) -> PatientMeta:
@@ -82,8 +87,8 @@ def fds_manu_meta(fds_metadata: dict, fds_header: dict) -> ManufacturerMeta:
     manufacture = ManufacturerMeta()
 
     manufacture.manufacturer = "Topcon"
-    manufacture.manufacturer_model = hw_info.get("model_name")
-    manufacture.device_serial = hw_info.get("serial_number")
+    manufacture.manufacturer_model = _model_name(hw_info.get("model_name"))
+    manufacture.device_serial = _model_name(hw_info.get("serial_number"))
     manufacture.software_version = (
         f"{fds_header.get('major_ver')}.{fds_header.get('minor_ver')}"
     )
@@ -91,43 +96,25 @@ def fds_manu_meta(fds_metadata: dict, fds_header: dict) -> ManufacturerMeta:
     return manufacture
 
 
-def fds_image_geom(pixel_spacing: list) -> ImageGeometry:
-    """Creates ImageGeometry from FDS metadata
+def fds_image_geom(pixel_spacing: list, scan_mode: int | None = None) -> ImageGeometry:
+    """Creates ImageGeometry from FDS metadata.
 
-    Args:
-        pixel_spacing: Pixel spacing calculated in the fds reader
-    Returns:
-        ImageGeometry: Geometry data populated by pixel_spacing
+    Same axis rules as FDA: vertical cubes swap the field sizes, and a
+    cross-scan gap is not stored as slice thickness.
     """
-    image_geom = ImageGeometry()
-    image_geom.pixel_spacing = [pixel_spacing[2], pixel_spacing[0]]
-    image_geom.slice_thickness = pixel_spacing[1]
-    image_geom.image_orientation = [1, 0, 0, 0, 1, 0]
-
-    return image_geom
+    return topcon_image_geometry(pixel_spacing, scan_mode)
 
 
-def fds_image_params() -> OCTImageParams:
-    """Creates OCTImageParams specific to Topcon
+def fds_image_params(model_name: str) -> OCTImageParams:
+    """OCT parameters for the model named in the FDS hardware chunk.
 
-    Args:
-        None
-    Returns:
-        OCTImageParams: Image params populated with Topcon defaults
+    Same conservative Topcon policy as FDA: nominal wavelength may be written
+    when the model matches; brochure spatial resolution / half-bandwidth are
+    kept on ``manufacturer_specs`` until DICOM equivalence is established.
     """
     image_params = OCTImageParams()
     image_params.opt_acquisition_device = OPTAcquisitionDevice.OCTScanner
-    image_params.DetectorType = OCTDetectorType.CCD
-    image_params.IlluminationWaveLength = 830
-    image_params.IlluminationPower = 800
-    image_params.IlluminationBandwidth = 50
-    image_params.DepthSpatialResolution = 6
-    image_params.MaximumDepthDistortion = 0.5
-    image_params.AlongscanSpatialResolution = 20
-    image_params.MaximumAlongscanDistortion = 0.5
-    image_params.AcrossscanSpatialResolution = 20
-    image_params.MaximumAcrossscanDistortion = 0.5
-
+    apply_topcon_device_specs(image_params, model_name)
     return image_params
 
 
@@ -139,11 +126,20 @@ def fds_dicom_metadata(oct: OCTVolumeWithMetaData) -> DicomMetadata:
     Returns:
         DicomMetadata: Populated DicomMetadata created with OCT metadata
     """
-    meta = DicomMetadata
-    meta.patient_info = fds_patient_meta(oct.metadata)
-    meta.series_info = fds_series_meta(oct.metadata)
-    meta.manufacturer_info = fds_manu_meta(oct.metadata, oct.header)
-    meta.image_geometry = fds_image_geom(oct.pixel_spacing)
-    meta.oct_image_params = fds_image_params()
+    patient_info = fds_patient_meta(oct.metadata)
+    series_info = fds_series_meta(oct.metadata)
+    manufacturer_info = fds_manu_meta(oct.metadata, oct.header)
+    header = oct.oct_header or {}
+    image_geometry = fds_image_geom(oct.pixel_spacing, header.get("scan_mode"))
+    oct_image_params = fds_image_params(manufacturer_info.manufacturer_model)
+    n_frames = int(header.get("number_slices") or 0) or len(oct.volume or [])
+    series_info.scan_pattern = topcon_scan_pattern(header.get("scan_mode"), n_frames)
+    series_info.scan_pattern_specified = True
 
-    return meta
+    return DicomMetadata(
+        patient_info=patient_info,
+        series_info=series_info,
+        manufacturer_info=manufacturer_info,
+        image_geometry=image_geometry,
+        oct_image_params=oct_image_params,
+    )

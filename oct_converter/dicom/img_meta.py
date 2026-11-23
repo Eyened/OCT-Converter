@@ -127,11 +127,10 @@ def img_dicom_metadata(oct: OCTVolumeWithMetaData) -> DicomMetadata:
         DicomMetadata: Populated DicomMetadata created with Zeiss defaults
         and information extracted from filename if able
     """
-    meta = DicomMetadata
-    meta.patient_info = img_patient_meta(oct.patient_id)
-    meta.series_info = img_series_meta(oct.acquisition_date, oct.laterality)
-    meta.manufacturer_info = img_manu_meta()
-    meta.image_geometry = img_image_geom()
-    meta.oct_image_params = img_image_params()
-
-    return meta
+    return DicomMetadata(
+        patient_info=img_patient_meta(oct.patient_id),
+        series_info=img_series_meta(oct.acquisition_date, oct.laterality),
+        manufacturer_info=img_manu_meta(),
+        image_geometry=img_image_geom(),
+        oct_image_params=img_image_params(),
+    )

@@ -61,6 +61,8 @@ header = Struct(
 
 # IMG_JPEG
 oct_header = Struct(
+    # 0 line, 1 circle, 2 3D, 3 radial, 4 cross, 6 vertical 3D, 11 5-line cross.
+    # Capture-info scan_mode is not this value; it stays 2 for most files.
     "scan_mode" / Int8un,
     "unknown1" / Int32un,
     "unknown2" / Int32un,
